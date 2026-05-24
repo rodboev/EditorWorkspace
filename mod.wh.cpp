@@ -49,28 +49,25 @@ Home and Gallery are already hidden using other tweaks.
 /*
 - ThisPC:
   - showThisPCAtTop: true
-    $name: Show This PC at top
-    $description: Adds This PC to the top of the navigation pane
-  - thisPCSortOrder: 0
-    $name: This PC sort order
-    $description: Relative position among added items (lower = higher in nav pane)
+    $name: Add to top
+    $description: Add an expandable entry for This PC to the top of the navigation pane
   - thisPCExpandable: true
-    $name: Make This PC expandable
+    $name: Make expandable
     $description: Shows drives underneath This PC when expanded
   - thisPCStartExpanded: true
-    $name: Start with This PC expanded
-    $description: Start with This PC node expanded
+    $name: Start expanded
+    $description: Auto-expand This PC when window opens
   $name: This PC
 - Desktop:
   - showDesktopAtTop: false
-    $name: Show Desktop at top
-    $description: Adds the Desktop namespace root to the top of the navigation pane
-  - desktopSortOrder: 1
-    $name: Desktop sort order
-    $description: Relative position among added items (lower = higher in nav pane)
+    $name: Add to top
+    $description: Adds the namespace root to the top of the navigation pane
   - desktopExpandable: false
-    $name: Make Desktop expandable
-    $description: Shows Desktop namespace children when expanded
+    $name: Make expandable
+    $description: Shows namespace children when expanded
+  - desktopAboveThisPC: true
+    $name: Place above This PC
+    $description: Disable if there are issues with separator lines.
   $name: Desktop
 - Chevrons:
   - fixChevronDrawing: true
@@ -104,11 +101,10 @@ Home and Gallery are already hidden using other tweaks.
 
 struct {
     bool showThisPCAtTop;
-    int thisPCSortOrder;
     bool thisPCExpandable;
     bool thisPCStartExpanded;
     bool showDesktopAtTop;
-    int desktopSortOrder;
+    bool desktopAboveThisPC;
     bool desktopExpandable;
     bool fixChevronDrawing;
     int chevronScale;
@@ -123,10 +119,15 @@ static HTREEITEM g_hCachedThisPC = nullptr;
 static HTREEITEM g_hCachedDesktop = nullptr;
 static HWND g_hCachedTree = nullptr;
 
+// 0=not ours, 1=This PC, 2=Desktop — set during AppendOneItem
+// so the TVM_INSERTITEM handler knows which item is being inserted
+// without comparing localized display text.
+static thread_local int g_insertingItem = 0;
+
 static bool ShouldRemoveSeparators()
 {
     return g_settings.showThisPCAtTop && g_settings.showDesktopAtTop &&
-           g_settings.desktopSortOrder < g_settings.thisPCSortOrder;
+           g_settings.desktopAboveThisPC;
 }
 
 // Rejects all children so a root appears as a flat clickable
@@ -220,27 +221,34 @@ HRESULT THISCALL AppendRoot_hook(
         unsigned long thisPCStyle = g_settings.thisPCStartExpanded ? 0x2 : 0;
 
         struct { PIDLIST_ABSOLUTE pidl; bool expandable; bool enabled;
-                 int sort; const WCHAR *label; unsigned long style; } items[2] = {
-            { g_pidlThisPC,  g_settings.thisPCExpandable,
-              g_settings.showThisPCAtTop, g_settings.thisPCSortOrder,
-              L"This PC", thisPCStyle },
-            { g_pidlDesktop, g_settings.desktopExpandable,
-              g_settings.showDesktopAtTop, g_settings.desktopSortOrder,
-              L"Desktop", 0 }
-        };
+                 int id; const WCHAR *label; unsigned long style; } items[2];
 
-        if (items[0].sort > items[1].sort)
+        if (g_settings.desktopAboveThisPC)
         {
-            auto tmp = items[0];
-            items[0] = items[1];
-            items[1] = tmp;
+            items[0] = { g_pidlDesktop, g_settings.desktopExpandable,
+                         g_settings.showDesktopAtTop, 2, L"Desktop", 0 };
+            items[1] = { g_pidlThisPC, g_settings.thisPCExpandable,
+                         g_settings.showThisPCAtTop, 1, L"This PC", thisPCStyle };
+        }
+        else
+        {
+            items[0] = { g_pidlThisPC, g_settings.thisPCExpandable,
+                         g_settings.showThisPCAtTop, 1, L"This PC", thisPCStyle };
+            items[1] = { g_pidlDesktop, g_settings.desktopExpandable,
+                         g_settings.showDesktopAtTop, 2, L"Desktop", 0 };
         }
 
         for (int i = 0; i < 2; i++)
+        {
             if (items[i].enabled)
+            {
+                g_insertingItem = items[i].id;
                 AppendOneItem(pThis, items[i].pidl, items[i].expandable,
                               grfEnumFlags, pFilter, items[i].label,
                               items[i].style);
+            }
+        }
+        g_insertingItem = 0;
 
         g_inCustomAppend = false;
     }
@@ -630,30 +638,20 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
     HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
     UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
-    // Cache HTREEITEMs at insertion time so we don't walk
-    // visible items by text on every paint/setitem.
-    if (uMsg == TVM_INSERTITEMW || uMsg == TVM_INSERTITEMA)
+    if (g_insertingItem && (uMsg == TVM_INSERTITEMW || uMsg == TVM_INSERTITEMA))
     {
         LRESULT result = SubClassTreeWndProc_orig(hWnd, uMsg, wParam,
                             lParam, uIdSubclass, dwRefData);
         HTREEITEM hNew = (HTREEITEM)result;
         if (hNew)
         {
-            WCHAR text[64] = {};
-            TVITEMEXW tvi = {};
-            tvi.mask = TVIF_HANDLE | TVIF_TEXT;
-            tvi.hItem = hNew;
-            tvi.pszText = text;
-            tvi.cchTextMax = ARRAYSIZE(text);
-            SendMessageW(hWnd, TVM_GETITEMW, 0, (LPARAM)&tvi);
-
-            if (wcscmp(text, L"This PC") == 0)
+            if (g_insertingItem == 1)
             {
                 g_hCachedThisPC = hNew;
                 g_hCachedTree = hWnd;
                 Wh_Log(L"[CACHE] This PC item=%p tree=%p", hNew, hWnd);
             }
-            else if (wcscmp(text, L"Desktop") == 0)
+            else if (g_insertingItem == 2)
             {
                 g_hCachedDesktop = hNew;
                 g_hCachedTree = hWnd;
@@ -740,24 +738,22 @@ HRESULT WINAPI DrawThemeBackground_hook(
 void LoadSettings()
 {
     g_settings.showThisPCAtTop = Wh_GetIntSetting(L"ThisPC.showThisPCAtTop");
-    g_settings.thisPCSortOrder = Wh_GetIntSetting(L"ThisPC.thisPCSortOrder");
     g_settings.thisPCExpandable = Wh_GetIntSetting(L"ThisPC.thisPCExpandable");
     g_settings.thisPCStartExpanded = Wh_GetIntSetting(L"ThisPC.thisPCStartExpanded");
     g_settings.showDesktopAtTop = Wh_GetIntSetting(L"Desktop.showDesktopAtTop");
-    g_settings.desktopSortOrder = Wh_GetIntSetting(L"Desktop.desktopSortOrder");
+    g_settings.desktopAboveThisPC = Wh_GetIntSetting(L"Desktop.desktopAboveThisPC");
     g_settings.desktopExpandable = Wh_GetIntSetting(L"Desktop.desktopExpandable");
     g_settings.fixChevronDrawing = Wh_GetIntSetting(L"Chevrons.fixChevronDrawing");
     g_settings.chevronScale = Wh_GetIntSetting(L"Chevrons.chevronScale");
 
-    // Force resample on next paint — handles theme/dark-mode changes.
     g_sepColor = CLR_INVALID;
 
-    Wh_Log(L"Settings: thisPCAtTop=%d (sort=%d, expand=%d, startExp=%d) "
-            L"desktopAtTop=%d (sort=%d, expand=%d) "
+    Wh_Log(L"Settings: thisPCAtTop=%d (expand=%d, startExp=%d) "
+            L"desktopAtTop=%d (above=%d, expand=%d) "
             L"sepRemoval=%d fixChevron=%d chevronScale=%d",
-            g_settings.showThisPCAtTop, g_settings.thisPCSortOrder,
+            g_settings.showThisPCAtTop,
             g_settings.thisPCExpandable, g_settings.thisPCStartExpanded,
-            g_settings.showDesktopAtTop, g_settings.desktopSortOrder,
+            g_settings.showDesktopAtTop, g_settings.desktopAboveThisPC,
             g_settings.desktopExpandable,
             ShouldRemoveSeparators(),
             g_settings.fixChevronDrawing,
