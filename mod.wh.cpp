@@ -95,8 +95,7 @@ Home and Gallery are already hidden using [standard](https://www.elevenforum.com
     $name: Chevron scale (%)
     $description: >-
       Size of expand/collapse chevrons. 0 or 100 = default size,
-      125 = 25% larger. Negative = absolute pixel size (-20 = 20×20 px).
-      Only applies when Fix chevron drawing is enabled.
+      125 = 25% larger. Only applies when Fix chevron drawing is enabled.
   - hidePinButtons: true
     $name: Hide "pin" icons
     $description: Hide gray pin icons to the right of Quick Access items.
@@ -253,15 +252,9 @@ static void CalcGlyphRect(LPCRECT src, RECT *dst)
     int w = src->right - src->left;
     int h = src->bottom - src->top;
     int s = g_settings.chevronScale;
-    if (s == 0) s = 100;
-    int nw, nh;
-    if (s < 0)
-        nw = nh = -s;
-    else
-    {
-        nw = MulDiv(w, s, 100);
-        nh = MulDiv(h, s, 100);
-    }
+    if (s <= 0) s = 100;
+    int nw = MulDiv(w, s, 100);
+    int nh = MulDiv(h, s, 100);
     dst->right  = src->right;
     dst->left   = src->right - nw;
     dst->top    = src->top + (h - nh) / 2;
