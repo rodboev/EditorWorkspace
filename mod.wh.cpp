@@ -144,12 +144,20 @@ static HWND g_hCachedTree = nullptr;
 // 0=not ours, 1=This PC, 2=Desktop — set during AppendOneItem
 // so the TVM_INSERTITEM handler knows which item is being inserted
 // without comparing localized display text.
-static thread_local int g_insertingItem = 0;
+static int g_insertingItem = 0;
+
+static void *g_pNscTree = nullptr;
+static unsigned long g_lastEnumFlags = 0;
+static IShellItemFilter *g_pLastFilter = nullptr;
+
+#define WM_NAVPANE_REFRESH (WM_APP + 0x100)
+static void RefreshNavPane();
+static void HotEnableInsert(HWND hWnd);
+static bool g_needHotInsert = false;
 
 static bool ShouldRemoveSeparators()
 {
-    return g_settings.showThisPCAtTop && g_settings.showDesktopAtTop &&
-           g_settings.desktopAboveThisPC;
+    return g_settings.showThisPCAtTop && g_settings.showDesktopAtTop;
 }
 
 // --- AppendRoot hook ---
@@ -160,7 +168,7 @@ using AppendRoot_t = HRESULT (THISCALL *)(
 
 AppendRoot_t AppendRoot_orig;
 
-static thread_local bool g_inCustomAppend = false;
+static bool g_inCustomAppend = false;
 
 static void AppendOneItem(
     void *pThis, PIDLIST_ABSOLUTE pidl, bool expandable,
@@ -189,6 +197,9 @@ HRESULT THISCALL AppendRoot_hook(
     void *pThis, IShellItem *psiRoot, unsigned long grfEnumFlags,
     unsigned long grfRootStyle, IShellItemFilter *pFilter)
 {
+    Wh_Log(L"[HOOK] AppendRoot: pThis=%p rootStyle=0x%lx inCustom=%d",
+           pThis, grfRootStyle, (int)g_inCustomAppend);
+
     if (g_inCustomAppend)
         return AppendRoot_orig(pThis, psiRoot, grfEnumFlags,
                                grfRootStyle, pFilter);
@@ -202,6 +213,15 @@ HRESULT THISCALL AppendRoot_hook(
 
     if (wantItems)
     {
+        g_pNscTree = pThis;
+        g_lastEnumFlags = grfEnumFlags;
+        if (g_pLastFilter != pFilter)
+        {
+            if (g_pLastFilter) g_pLastFilter->Release();
+            g_pLastFilter = pFilter;
+            if (g_pLastFilter) g_pLastFilter->AddRef();
+        }
+
         g_inCustomAppend = true;
 
         unsigned long thisPCStyle = g_settings.thisPCStartExpanded ? 0x2 : 0;
@@ -224,7 +244,7 @@ HRESULT THISCALL AppendRoot_hook(
                          g_settings.showDesktopAtTop, 2, L"Desktop", 0 };
         }
 
-        for (int i = 0; i < 2; i++)
+        for (int i = 1; i >= 0; i--)
         {
             if (items[i].enabled)
             {
@@ -668,11 +688,16 @@ static void EnsureParentSubclass(HWND hTree)
 
 using SetStateImageList_t = HRESULT (THISCALL *)(void *, HIMAGELIST);
 SetStateImageList_t SetStateImageList_orig;
+static HIMAGELIST g_savedStateImageList = nullptr;
 
 HRESULT THISCALL SetStateImageList_hook(void *pThis, HIMAGELIST himl)
 {
     if (g_settings.hidePinButtons)
+    {
+        if (himl)
+            g_savedStateImageList = himl;
         return S_OK;
+    }
     return SetStateImageList_orig(pThis, himl);
 }
 
@@ -683,13 +708,16 @@ HRESULT THISCALL SetStateImageList_hook(void *pThis, HIMAGELIST himl)
 // are cached, walk depth-1 items and delete any matching childless
 // duplicates (QA pins have no children; nav pane sections do).
 
-static void CleanupQuickAccessDuplicates(HWND hTree)
+// Returns true if all expected duplicates were found (or none expected).
+// Returns false if some are still missing (caller should retry later).
+static bool CleanupQuickAccessDuplicates(HWND hTree)
 {
     if (!g_hCachedThisPC && !g_hCachedDesktop)
-        return;
+        return true;
 
     WCHAR thisPCText[64] = {};
     WCHAR desktopText[64] = {};
+    int expectedCount = 0;
 
     if (g_settings.showThisPCAtTop &&
         g_settings.hideThisPCFromQuickAccess && g_hCachedThisPC)
@@ -700,6 +728,7 @@ static void CleanupQuickAccessDuplicates(HWND hTree)
         tvi.pszText = thisPCText;
         tvi.cchTextMax = ARRAYSIZE(thisPCText);
         SendMessageW(hTree, TVM_GETITEMW, 0, (LPARAM)&tvi);
+        if (thisPCText[0]) expectedCount++;
     }
 
     if (g_settings.showDesktopAtTop &&
@@ -711,11 +740,15 @@ static void CleanupQuickAccessDuplicates(HWND hTree)
         tvi.pszText = desktopText;
         tvi.cchTextMax = ARRAYSIZE(desktopText);
         SendMessageW(hTree, TVM_GETITEMW, 0, (LPARAM)&tvi);
+        if (desktopText[0]) expectedCount++;
     }
+
+    if (!expectedCount)
+        return true;
 
     HTREEITEM h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM,
                                           TVGN_ROOT, 0);
-    if (!h) return;
+    if (!h) return false;
 
     // Walk depth-1 items (children of root)
     h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM,
@@ -785,6 +818,8 @@ static void CleanupQuickAccessDuplicates(HWND hTree)
         Wh_Log(L"[QA-HIDE] deleting duplicate item=%p", toDelete[i]);
         SendMessageW(hTree, TVM_DELETEITEM, 0, (LPARAM)toDelete[i]);
     }
+
+    return (delCount >= expectedCount);
 }
 
 // --- SubClassTreeWndProc ---
@@ -800,6 +835,12 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
 {
     if (uMsg == TVM_INSERTITEMW || uMsg == TVM_INSERTITEMA)
     {
+        if (g_insertingItem && lParam)
+        {
+            TVINSERTSTRUCTW *pInsert = (TVINSERTSTRUCTW *)lParam;
+            pInsert->hInsertAfter = TVI_FIRST;
+        }
+
         LRESULT result = SubClassTreeWndProc_orig(hWnd, uMsg, wParam,
                             lParam, uIdSubclass, dwRefData);
         HTREEITEM hNew = (HTREEITEM)result;
@@ -811,6 +852,8 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
                 g_hCachedTree = hWnd;
                 g_qaCleanupDone = false;
                 g_hiddenDuplicate = nullptr;
+                SetPropW(hWnd, L"WH_NscTree", (HANDLE)g_pNscTree);
+                SetPropW(hWnd, L"WH_EnumFlags", (HANDLE)(ULONG_PTR)g_lastEnumFlags);
                 Wh_Log(L"[CACHE] This PC item=%p tree=%p", hNew, hWnd);
             }
             else if (g_insertingItem == 2)
@@ -819,6 +862,8 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
                 g_hCachedTree = hWnd;
                 g_qaCleanupDone = false;
                 g_hiddenDuplicate = nullptr;
+                SetPropW(hWnd, L"WH_NscTree", (HANDLE)g_pNscTree);
+                SetPropW(hWnd, L"WH_EnumFlags", (HANDLE)(ULONG_PTR)g_lastEnumFlags);
                 Wh_Log(L"[CACHE] Desktop item=%p tree=%p", hNew, hWnd);
             }
             else if (g_qaCleanupDone && g_hCachedTree == hWnd)
@@ -929,12 +974,20 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
 
     if (uMsg == WM_PAINT)
     {
+        // Hot-enable deferred insertion: items are inserted on the UI
+        // thread so TVM_INSERTITEM fires through the subclass (TVI_FIRST
+        // + caching work). Items land as children of the hidden root.
+        if (g_needHotInsert && g_hCachedTree == hWnd)
+        {
+            g_needHotInsert = false;
+            HotEnableInsert(hWnd);
+        }
+
         if (!g_qaCleanupDone && g_hCachedTree == hWnd &&
             ((g_settings.showThisPCAtTop && g_settings.hideThisPCFromQuickAccess) ||
              (g_settings.showDesktopAtTop && g_settings.hideDesktopFromQuickAccess)))
         {
-            g_qaCleanupDone = true;
-            CleanupQuickAccessDuplicates(hWnd);
+            g_qaCleanupDone = CleanupQuickAccessDuplicates(hWnd);
         }
 
         if (g_settings.hidePinButtons)
@@ -942,7 +995,10 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
             HIMAGELIST hState = (HIMAGELIST)SendMessageW(
                 hWnd, TVM_GETIMAGELIST, TVSIL_STATE, 0);
             if (hState)
+            {
+                g_savedStateImageList = hState;
                 SendMessageW(hWnd, TVM_SETIMAGELIST, TVSIL_STATE, 0);
+            }
         }
 
         if (ShouldRemoveSeparators() || g_hiddenDuplicate)
@@ -957,6 +1013,13 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
         g_inTreePaint = false;
 
         return result;
+    }
+
+    if (uMsg == WM_NAVPANE_REFRESH)
+    {
+        Wh_Log(L"[REFRESH] WM_NAVPANE_REFRESH received on UI thread");
+        RefreshNavPane();
+        return 0;
     }
 
     return SubClassTreeWndProc_orig(hWnd, uMsg, wParam, lParam,
@@ -1096,16 +1159,370 @@ BOOL Wh_ModInit()
     }
 
     Wh_Log(L"Mod initialized successfully");
+
+    // Re-enable on existing Explorer windows: find the nav pane's
+    // INameSpaceTreeControl via the shell browser COM interface,
+    // then rebuild with our items.
+    DWORD pid = GetCurrentProcessId();
+    EnumWindows([](HWND hTop, LPARAM lPid) -> BOOL {
+        DWORD wndPid = 0;
+        GetWindowThreadProcessId(hTop, &wndPid);
+        if (wndPid != (DWORD)lPid)
+            return TRUE;
+        WCHAR cls[64];
+        GetClassNameW(hTop, cls, ARRAYSIZE(cls));
+        if (wcscmp(cls, L"CabinetWClass") != 0)
+            return TRUE;
+
+        Wh_Log(L"[ENABLE] Found CabinetWClass=%p", hTop);
+
+        // CWM_GETISHELLBROWSER = WM_USER + 7; try ShellTabWindowClass first
+        HWND hShellTab = FindWindowExW(hTop, nullptr, L"ShellTabWindowClass", nullptr);
+        IShellBrowser *pSB = nullptr;
+        if (hShellTab)
+            pSB = (IShellBrowser *)SendMessageW(hShellTab, WM_USER + 7, 0, 0);
+        if (!pSB)
+            pSB = (IShellBrowser *)SendMessageW(hTop, WM_USER + 7, 0, 0);
+        if (!pSB)
+        {
+            Wh_Log(L"[ENABLE] No IShellBrowser (ShellTab=%p)", hShellTab);
+            return TRUE;
+        }
+
+        IServiceProvider *pSP = nullptr;
+        if (FAILED(pSB->QueryInterface(IID_IServiceProvider, (void **)&pSP)))
+        {
+            Wh_Log(L"[ENABLE] No IServiceProvider");
+            return TRUE;
+        }
+
+        INameSpaceTreeControl *pNsc = nullptr;
+        HRESULT hr = pSP->QueryService(IID_INameSpaceTreeControl,
+                                         IID_INameSpaceTreeControl,
+                                         (void **)&pNsc);
+        if (FAILED(hr))
+        {
+            Wh_Log(L"[ENABLE] QueryService INameSpaceTreeControl failed: 0x%lx", hr);
+            pSP->Release();
+            return TRUE;
+        }
+        pSP->Release();
+
+        Wh_Log(L"[ENABLE] Got INameSpaceTreeControl=%p", pNsc);
+
+        // Recover enum flags from window property, or use default
+        HWND hTree = nullptr;
+        EnumChildWindows(hTop, [](HWND hChild, LPARAM lParam) -> BOOL {
+            WCHAR c[64];
+            GetClassNameW(hChild, c, ARRAYSIZE(c));
+            if (wcscmp(c, L"SysTreeView32") == 0)
+            {
+                *(HWND *)lParam = hChild;
+                return FALSE;
+            }
+            return TRUE;
+        }, (LPARAM)&hTree);
+
+        unsigned long enumFlags = 0;
+        if (hTree)
+            enumFlags = (unsigned long)(ULONG_PTR)GetPropW(hTree, L"WH_EnumFlags");
+        if (!enumFlags)
+            enumFlags = SHCONTF_FOLDERS;
+
+        IShellItem *pDesktop = nullptr;
+        IShellItem *pThisPC = nullptr;
+        if (g_pidlDesktop)
+            SHCreateItemFromIDList(g_pidlDesktop, IID_IShellItem, (void **)&pDesktop);
+        if (g_pidlThisPC)
+            SHCreateItemFromIDList(g_pidlThisPC, IID_IShellItem, (void **)&pThisPC);
+
+        if (pThisPC) { while (SUCCEEDED(pNsc->RemoveRoot(pThisPC))); }
+        if (pDesktop) { while (SUCCEEDED(pNsc->RemoveRoot(pDesktop))); }
+
+        if (pDesktop)
+        {
+            Wh_Log(L"[ENABLE] Rebuilding nav pane (hidden root only)");
+
+            g_pNscTree = (void *)pNsc;
+            g_lastEnumFlags = enumFlags;
+
+            // Rebuild with just the hidden root. Our items will be
+            // inserted later on the UI thread via WM_NAVPANE_HOTINSERT.
+            g_inCustomAppend = true;
+            AppendRoot_orig(g_pNscTree, pDesktop, enumFlags, 0x3, nullptr);
+            g_inCustomAppend = false;
+
+            // Re-find tree HWND (may have been recreated during rebuild)
+            HWND hTreeNew = nullptr;
+            EnumChildWindows(hTop, [](HWND hChild, LPARAM lParam) -> BOOL {
+                WCHAR c[64];
+                GetClassNameW(hChild, c, ARRAYSIZE(c));
+                if (wcscmp(c, L"SysTreeView32") == 0)
+                {
+                    *(HWND *)lParam = hChild;
+                    return FALSE;
+                }
+                return TRUE;
+            }, (LPARAM)&hTreeNew);
+            if (!hTreeNew) hTreeNew = hTree;
+
+            g_hCachedTree = hTreeNew;
+            g_hCachedThisPC = nullptr;
+            g_hCachedDesktop = nullptr;
+            g_qaCleanupDone = false;
+            g_hiddenDuplicate = nullptr;
+            g_sepColor = CLR_INVALID;
+
+            SetPropW(hTreeNew, L"WH_NscTree", (HANDLE)g_pNscTree);
+            SetPropW(hTreeNew, L"WH_EnumFlags", (HANDLE)(ULONG_PTR)enumFlags);
+
+            // Defer item insertion to the next WM_PAINT on the UI thread.
+            // WM_PAINT fires through SubClassTreeWndProc_hook, where
+            // intra-thread AppendRoot_orig → TVM_INSERTITEM triggers
+            // the subclass: TVI_FIRST works, caching works, and items
+            // become children of the hidden root.
+            g_needHotInsert = true;
+            InvalidateRect(hTreeNew, nullptr, TRUE);
+            Wh_Log(L"[ENABLE] Deferred insertion to next WM_PAINT, tree=%p", hTreeNew);
+        }
+
+        if (pDesktop) pDesktop->Release();
+        if (pThisPC) pThisPC->Release();
+        pNsc->Release();
+        return TRUE;
+    }, (LPARAM)pid);
+
     return TRUE;
+}
+
+static void RefreshNavPane()
+{
+    HWND hTree = g_hCachedTree;
+    if (!hTree || !IsWindow(hTree) || !g_pNscTree)
+        return;
+
+    if (g_hCachedThisPC)
+    {
+        SendMessageW(hTree, TVM_DELETEITEM, 0, (LPARAM)g_hCachedThisPC);
+        g_hCachedThisPC = nullptr;
+    }
+    if (g_hCachedDesktop)
+    {
+        SendMessageW(hTree, TVM_DELETEITEM, 0, (LPARAM)g_hCachedDesktop);
+        g_hCachedDesktop = nullptr;
+    }
+
+    // Restore hidden duplicate's iIntegral to 2 (section boundary)
+    // before clearing it, so cleanup can re-evaluate it correctly.
+    // Clear g_hiddenDuplicate first so our TVM_SETITEMW hook
+    // doesn't clamp it back to 1.
+    HTREEITEM prevHidden = g_hiddenDuplicate;
+    g_hiddenDuplicate = nullptr;
+    if (prevHidden)
+    {
+        TVITEMEXW restore = {};
+        restore.mask = TVIF_HANDLE | TVIF_INTEGRAL;
+        restore.hItem = prevHidden;
+        restore.iIntegral = 2;
+        SendMessageW(hTree, TVM_SETITEMW, 0, (LPARAM)&restore);
+    }
+
+    g_qaCleanupDone = false;
+    g_sepColor = CLR_INVALID;
+
+    g_inCustomAppend = true;
+
+    unsigned long thisPCStyle = g_settings.thisPCStartExpanded ? 0x2 : 0;
+
+    struct { PIDLIST_ABSOLUTE pidl; bool expandable; bool enabled;
+             int id; const WCHAR *label; unsigned long style; } items[2];
+
+    if (g_settings.desktopAboveThisPC)
+    {
+        items[0] = { g_pidlDesktop, g_settings.desktopExpandable,
+                     g_settings.showDesktopAtTop, 2, L"Desktop", 0 };
+        items[1] = { g_pidlThisPC, g_settings.thisPCExpandable,
+                     g_settings.showThisPCAtTop, 1, L"This PC", thisPCStyle };
+    }
+    else
+    {
+        items[0] = { g_pidlThisPC, g_settings.thisPCExpandable,
+                     g_settings.showThisPCAtTop, 1, L"This PC", thisPCStyle };
+        items[1] = { g_pidlDesktop, g_settings.desktopExpandable,
+                     g_settings.showDesktopAtTop, 2, L"Desktop", 0 };
+    }
+
+    for (int i = 1; i >= 0; i--)
+    {
+        if (items[i].enabled)
+        {
+            g_insertingItem = items[i].id;
+            AppendOneItem(g_pNscTree, items[i].pidl, items[i].expandable,
+                          g_lastEnumFlags, g_pLastFilter, items[i].label,
+                          items[i].style);
+        }
+    }
+    g_insertingItem = 0;
+    g_inCustomAppend = false;
+
+    RedrawWindow(hTree, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+}
+
+static void HotEnableInsert(HWND hWnd)
+{
+    Wh_Log(L"[HOTINSERT] Running in WM_PAINT, tree=%p", hWnd);
+
+    if (!g_pNscTree || !IsWindow(hWnd))
+        return;
+
+    // Verify hidden root is populated (has depth-1 children).
+    // If not, re-set the flag so the next WM_PAINT retries.
+    HTREEITEM hRoot = (HTREEITEM)SendMessageW(hWnd, TVM_GETNEXTITEM, TVGN_ROOT, 0);
+    HTREEITEM hFirstChild = hRoot ?
+        (HTREEITEM)SendMessageW(hWnd, TVM_GETNEXTITEM, TVGN_CHILD, (LPARAM)hRoot) : nullptr;
+    if (!hFirstChild)
+    {
+        Wh_Log(L"[HOTINSERT] Tree not populated yet, will retry next paint");
+        g_needHotInsert = true;
+        return;
+    }
+
+    g_hCachedTree = hWnd;
+    g_hCachedThisPC = nullptr;
+    g_hCachedDesktop = nullptr;
+    g_qaCleanupDone = false;
+    g_hiddenDuplicate = nullptr;
+    g_sepColor = CLR_INVALID;
+
+    // Insert our items on the UI thread. Since we're on the same
+    // thread as the tree, AppendRoot_orig → TVM_INSERTITEM fires
+    // through the subclass chain: TVI_FIRST + caching all work.
+    // Items become children of the hidden root (same as fresh open).
+    g_inCustomAppend = true;
+
+    unsigned long thisPCStyle = g_settings.thisPCStartExpanded ? 0x2 : 0;
+
+    struct { PIDLIST_ABSOLUTE pidl; bool expandable; bool enabled;
+             int id; const WCHAR *label; unsigned long style; } items[2];
+
+    if (g_settings.desktopAboveThisPC)
+    {
+        items[0] = { g_pidlDesktop, g_settings.desktopExpandable,
+                     g_settings.showDesktopAtTop, 2, L"Desktop", 0 };
+        items[1] = { g_pidlThisPC, g_settings.thisPCExpandable,
+                     g_settings.showThisPCAtTop, 1, L"This PC", thisPCStyle };
+    }
+    else
+    {
+        items[0] = { g_pidlThisPC, g_settings.thisPCExpandable,
+                     g_settings.showThisPCAtTop, 1, L"This PC", thisPCStyle };
+        items[1] = { g_pidlDesktop, g_settings.desktopExpandable,
+                     g_settings.showDesktopAtTop, 2, L"Desktop", 0 };
+    }
+
+    for (int i = 1; i >= 0; i--)
+    {
+        if (items[i].enabled)
+        {
+            g_insertingItem = items[i].id;
+            AppendOneItem(g_pNscTree, items[i].pidl, items[i].expandable,
+                          g_lastEnumFlags, g_pLastFilter, items[i].label,
+                          items[i].style);
+        }
+    }
+    g_insertingItem = 0;
+    g_inCustomAppend = false;
+
+    Wh_Log(L"[HOTINSERT] Items inserted, ThisPC=%p Desktop=%p",
+           g_hCachedThisPC, g_hCachedDesktop);
+
+    // Invalidate for dedup and separator setup on the next paint
+    // (not RDW_UPDATENOW since we're already inside WM_PAINT)
+    InvalidateRect(hWnd, nullptr, TRUE);
 }
 
 void Wh_ModSettingsChanged()
 {
     LoadSettings();
+    if (g_hCachedTree && IsWindow(g_hCachedTree))
+        PostMessageW(g_hCachedTree, WM_NAVPANE_REFRESH, 0, 0);
 }
 
 void Wh_ModUninit()
 {
+    // Clear state so hooks become no-ops, but keep subclass
+    // for one final paint to suppress phantom separators
+    g_settings = {};
+    g_hiddenDuplicate = nullptr;
+    g_qaCleanupDone = false;
+    g_sepColor = CLR_INVALID;
+    g_needHotInsert = false;
+
+    // Remove all roots and re-add the hidden root without our items.
+    // RemoveRoot cleans up CNscTree's internal root tracking (not just
+    // the tree view item). Re-adding the hidden root repopulates the
+    // nav pane from scratch, as if the window just opened.
+    INameSpaceTreeControl *pNsc = (INameSpaceTreeControl *)g_pNscTree;
+    if (pNsc && g_pidlDesktop)
+    {
+        IShellItem *pDesktop = nullptr;
+        IShellItem *pThisPC = nullptr;
+        SHCreateItemFromIDList(g_pidlDesktop, IID_IShellItem, (void **)&pDesktop);
+        if (g_pidlThisPC)
+            SHCreateItemFromIDList(g_pidlThisPC, IID_IShellItem, (void **)&pThisPC);
+
+        if (pThisPC)
+        {
+            while (SUCCEEDED(pNsc->RemoveRoot(pThisPC)))
+                ;
+            Wh_Log(L"[DISABLE] RemoveRoot ThisPC (all)");
+        }
+        if (pDesktop)
+        {
+            while (SUCCEEDED(pNsc->RemoveRoot(pDesktop)))
+                ;
+            Wh_Log(L"[DISABLE] RemoveRoot Desktop (all)");
+        }
+
+        // Re-add the hidden root — settings are zeroed so our
+        // AppendRoot_hook passes through without adding custom items
+        if (pDesktop && g_pNscTree)
+        {
+            Wh_Log(L"[DISABLE] Re-adding hidden root");
+            AppendRoot_orig(g_pNscTree, pDesktop, g_lastEnumFlags,
+                           0x1, g_pLastFilter);
+        }
+
+        if (pDesktop) pDesktop->Release();
+        if (pThisPC) pThisPC->Release();
+    }
+    g_hCachedThisPC = nullptr;
+    g_hCachedDesktop = nullptr;
+
+    // Restore pin icons (state image list) if we hid them
+    if (g_savedStateImageList && g_hCachedTree && IsWindow(g_hCachedTree))
+    {
+        SendMessageW(g_hCachedTree, TVM_SETIMAGELIST, TVSIL_STATE,
+                     (LPARAM)g_savedStateImageList);
+        Wh_Log(L"[DISABLE] Restored state image list %p", g_savedStateImageList);
+    }
+    g_savedStateImageList = nullptr;
+
+    // Remove subclass first, then redraw with Explorer's native paint
+    for (HWND parent : g_subclassedParents)
+    {
+        if (IsWindow(parent))
+            WindhawkUtils::RemoveWindowSubclassFromAnyThread(parent, SepParentSubclassProc);
+    }
+    g_subclassedParents.clear();
+
+    if (g_hCachedTree && IsWindow(g_hCachedTree))
+    {
+        RedrawWindow(g_hCachedTree, nullptr, nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    }
+
     if (g_gdipToken)
     {
         Gdiplus::GdiplusShutdown(g_gdipToken);
@@ -1121,15 +1538,15 @@ void Wh_ModUninit()
         CoTaskMemFree(g_pidlDesktop);
         g_pidlDesktop = nullptr;
     }
-    for (HWND parent : g_subclassedParents)
-    {
-        if (IsWindow(parent))
-            WindhawkUtils::RemoveWindowSubclassFromAnyThread(parent, SepParentSubclassProc);
-    }
-    g_subclassedParents.clear();
     g_hCachedThisPC = nullptr;
     g_hCachedDesktop = nullptr;
     g_hCachedTree = nullptr;
-    g_hiddenDuplicate = nullptr;
+    g_pNscTree = nullptr;
+    g_lastEnumFlags = 0;
+    if (g_pLastFilter)
+    {
+        g_pLastFilter->Release();
+        g_pLastFilter = nullptr;
+    }
     Wh_Log(L"Mod uninitialized");
 }
