@@ -54,11 +54,11 @@ Home and Gallery are already hidden using other tweaks.
   $name: This PC sort order
   $description: Relative position among added items (lower = higher in nav pane)
 - thisPCExpandable: true
-  $name: This PC expandable
+  $name: Make This PC expandable
   $description: Shows drives underneath This PC when expanded
 - thisPCStartExpanded: true
-  $name: Show This PC expanded
-  $description: Start with This PC node expanded (uses NSTCRS_EXPANDED root style bit)
+  $name: Start with This PC expanded
+  $description: Start with This PC node expanded
 - showDesktopAtTop: false
   $name: Show Desktop at top
   $description: Adds the Desktop namespace root to the top of the navigation pane
@@ -66,7 +66,7 @@ Home and Gallery are already hidden using other tweaks.
   $name: Desktop sort order
   $description: Relative position among added items (lower = higher in nav pane)
 - desktopExpandable: false
-  $name: Desktop expandable
+  $name: Make Desktop expandable
   $description: Shows Desktop namespace children when expanded
 - removeExtraSeparators: true
   $name: Remove extra separators
