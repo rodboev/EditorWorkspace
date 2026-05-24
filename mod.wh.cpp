@@ -1,12 +1,13 @@
 // ==WindhawkMod==
-// @id              add-virtual-folders-to-nav-pane
+// @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's navigation pane
 // @version         1.0
-// @author          Rod
-// @include         explorer.exe
+// @author          Rod Boev
+// @github          https://github.com/rodboev
+// @include         *
 // @architecture    x86-64
-// @compilerOptions -lole32 -lshell32 -lshlwapi -luuid -luxtheme -lgdi32 -lgdiplus -lcomctl32
+// @compilerOptions -lole32 -lshell32 -luuid -luxtheme -lgdi32 -lgdiplus -lcomctl32
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -18,30 +19,39 @@ This mod adds two virtual folders to the top of File Explorer's
 navigation pane and fixes the chevron rendering.
 
 - **Show This PC at top:** Adds an expandable This PC entry
-(with drives.)
+with drives. (Expandable This PC can't be pinned to the top
+without this mod.)
 
 - **Show Desktop at top:** Adds a Desktop entry for the root
 namespace object. This includes Recycle Bin, Control Panel, etc.
-instead of just the items on the desktop.
+instead of just the items on the desktop. (This target can't be
+pinned without this mod.)
 
 - **Fix chevron drawing:** Replaces the pixelated and clipped
 chevron with a smooth anti-aliased versions. The size can be
 tweaked to any percentage or pixel dimensions.
 
 Both virtual folders have a toggle for whether they are expandable
-or not, and can be repositioned relative to one another.
+or not. Their position can be swapped. Duplicate entries of Desktop
+or This PC can be removed from other parts of the nav.
+
+This mod injects only in processes that have ExplorerFrame.dll,
+so the include is set to `*` but it will not touch most processes.
+You can set it to `explorer.exe` only, if you don't want the nav in
+Open/Save dialogs changed (only modern dialogs are affected.)
 
 Before:
 
-![Before](https://i.imgur.com/PdNEJqI.png)
+![Before](https://i.imgur.com/aahBZPG.png)
 
 After:
 
-![After](https://i.imgur.com/Aexl4Dh.png)
+![After](https://i.imgur.com/e2fEDwb.png)
 
 The screenshots show the mod with the normal Desktop pinned to
 Quick Access in before, compared to adding it using the mod.
-Home and Gallery are already hidden using other tweaks.
+
+Home and Gallery are already hidden using [standard](https://www.elevenforum.com/t/add-show-home-on-navigation-pane-to-folder-options-in-windows-11.27300/) [methods](https://www.elevenforum.com/t/add-show-gallery-on-navigation-pane-to-folder-options-in-windows-11.27301/).
 */
 // ==/WindhawkModReadme==
 
@@ -50,34 +60,30 @@ Home and Gallery are already hidden using other tweaks.
 - ThisPC:
   - showThisPCAtTop: true
     $name: Add to top
-    $description: Add an expandable entry for This PC to the top of the navigation pane
+    $description: Add an expandable entry for This PC to the top of the navigation pane.
   - thisPCExpandable: true
     $name: Make expandable
-    $description: Shows drives underneath This PC when expanded
+    $description: Shows drives underneath This PC when expanded.
   - thisPCStartExpanded: true
     $name: Start expanded
-    $description: Auto-expand This PC when window opens
+    $description: Auto-expand This PC when window opens.
   - hideThisPCFromQuickAccess: true
-    $name: Hide from Quick Access
-    $description: >-
-      Hides This PC if it appears under Quick Access (e.g. if pinned).
-      Useful when it is already added to the top by this mod.
+    $name: Hide duplicates
+    $description: Hide This PC elsewhere in nav. Disable if there are issues with separators.
   $name: This PC
 - Desktop:
   - showDesktopAtTop: false
     $name: Add to top
-    $description: Adds the namespace root to the top of the navigation pane
+    $description: Adds the namespace root to the top of the navigation pane.
   - desktopExpandable: false
     $name: Make expandable
-    $description: Shows namespace children when expanded
+    $description: Shows namespace children when expanded.
   - desktopAboveThisPC: true
     $name: Place above This PC
     $description: Disable if there are issues with separator lines.
   - hideDesktopFromQuickAccess: true
-    $name: Hide from Quick Access
-    $description: >-
-      Hides Desktop if it appears under Quick Access (e.g. if pinned).
-      Useful when it is already added to the top by this mod.
+    $name: Hide duplicates
+    $description: Hide Desktop elsewhere in nav. Disable if there are issues with separators.
   $name: Desktop
 - Resources:
   - fixChevronDrawing: true
@@ -92,10 +98,8 @@ Home and Gallery are already hidden using other tweaks.
       125 = 25% larger. Negative = absolute pixel size (-20 = 20×20 px).
       Only applies when Fix chevron drawing is enabled.
   - hidePinButtons: true
-    $name: Hide pin buttons
-    $description: >-
-      Hides the gray pin icons next to Quick Access items
-      in the navigation pane.
+    $name: Hide "pin" icons
+    $description: Hide gray pin icons to the right of Quick Access items.
   $name: Resources
 */
 // ==/WindhawkModSettings==
@@ -103,8 +107,8 @@ Home and Gallery are already hidden using other tweaks.
 #include <windhawk_api.h>
 #include <windhawk_utils.h>
 #include <shlobj.h>
-#include <shlwapi.h>
 #include <commctrl.h>
+#include <windowsx.h>
 #include <uxtheme.h>
 #include <gdiplus.h>
 #include <set>
@@ -401,6 +405,9 @@ static COLORREF SampleSeparatorColor(HWND hTree, HDC hdc)
 // Tracks last-drawn positions to only log when something changes.
 static int g_lastSepPositions[8] = {};
 static int g_lastSepCount = 0;
+static bool g_qaCleanupDone = false;
+static HTREEITEM g_hQABoundaryItem = nullptr;
+static HTREEITEM g_hiddenDuplicate = nullptr;
 
 static void RedrawOtherSeparators(HWND hTree, HDC hdc)
 {
@@ -492,6 +499,7 @@ static void RedrawOtherSeparators(HWND hTree, HDC hdc)
                                     TVGN_NEXTVISIBLE, (LPARAM)h);
     }
 
+
     // Only log when positions change
     bool changed = (restored != g_lastSepCount);
     if (!changed)
@@ -519,7 +527,7 @@ static void RedrawOtherSeparators(HWND hTree, HDC hdc)
 
 // Parent subclass — intercepts NM_CUSTOMDRAW.
 // Returning CDRF_NOTIFYPOSTPAINT at CDDS_PREPAINT without calling
-// DefSubclassProc hides ALL separator lines (proven by treeline-killer).
+// DefSubclassProc hides ALL separator lines
 // At CDDS_POSTPAINT we redraw the separators we want to keep.
 static LRESULT CALLBACK SepParentSubclassProc(
     HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
@@ -532,35 +540,93 @@ static LRESULT CALLBACK SepParentSubclassProc(
         LPNMHDR hdr = (LPNMHDR)lParam;
         if (hdr && hdr->hwndFrom == hTree)
         {
-            if (hdr->code == (UINT)NM_CUSTOMDRAW && ShouldRemoveSeparators())
+            if (hdr->code == (UINT)NM_CUSTOMDRAW)
             {
                 LPNMTVCUSTOMDRAW cd = (LPNMTVCUSTOMDRAW)lParam;
                 DWORD stage = cd->nmcd.dwDrawStage;
+                bool removeSep = ShouldRemoveSeparators();
+                bool hasDupHide = (g_hiddenDuplicate != nullptr);
 
-                if (stage == CDDS_PREPAINT)
+                if (stage == CDDS_PREPAINT && (removeSep || hasDupHide))
                 {
-                    if (g_sepColor == CLR_INVALID)
+                    if (removeSep)
+                    {
+                        if (g_sepColor == CLR_INVALID)
+                        {
+                            LRESULT r = DefSubclassProc(hWnd, uMsg, wParam, lParam);
+                            return r | CDRF_NOTIFYPOSTPAINT;
+                        }
+                        return CDRF_NOTIFYPOSTPAINT;
+                    }
+                    else
                     {
                         LRESULT r = DefSubclassProc(hWnd, uMsg, wParam, lParam);
                         return r | CDRF_NOTIFYPOSTPAINT;
                     }
-                    return CDRF_NOTIFYPOSTPAINT;
                 }
 
                 if (stage == CDDS_POSTPAINT)
                 {
-                    if (g_sepColor == CLR_INVALID)
+                    if (g_sepColor == CLR_INVALID && (removeSep || hasDupHide))
                     {
                         COLORREF c = SampleSeparatorColor(hTree, cd->nmcd.hdc);
                         if (c != CLR_INVALID)
                         {
                             g_sepColor = c;
                             Wh_Log(L"[SEP-COLOR] captured separator color: 0x%06X", c);
-                            InvalidateRect(hTree, NULL, TRUE);
+                            if (removeSep)
+                                InvalidateRect(hTree, NULL, TRUE);
                         }
                     }
-                    if (g_sepColor != CLR_INVALID)
+
+                    if (removeSep && g_sepColor != CLR_INVALID)
                         RedrawOtherSeparators(hTree, cd->nmcd.hdc);
+
+                    if (hasDupHide)
+                    {
+                        RECT rcHide = {};
+                        *(HTREEITEM*)&rcHide = g_hiddenDuplicate;
+                        if (SendMessageW(hTree, TVM_GETITEMRECT, FALSE, (LPARAM)&rcHide))
+                        {
+                            HDC hdc = cd->nmcd.hdc;
+                            COLORREF bg = GetPixel(hdc, 1, rcHide.top + 2);
+                            if (bg == CLR_INVALID || bg == 0)
+                            {
+                                RECT client;
+                                GetClientRect(hTree, &client);
+                                bg = GetPixel(hdc, client.right - 2, rcHide.top + 2);
+                            }
+                            if (bg != CLR_INVALID)
+                            {
+                                HBRUSH bgBrush = CreateSolidBrush(bg);
+                                if (bgBrush)
+                                {
+                                    FillRect(hdc, &rcHide, bgBrush);
+                                    DeleteObject(bgBrush);
+                                }
+                            }
+
+                            if (g_sepColor != CLR_INVALID)
+                            {
+                                int h = rcHide.bottom - rcHide.top;
+                                int sepY = rcHide.top + h / 2;
+                                RECT client;
+                                GetClientRect(hTree, &client);
+                                int padL = 18, padR = 18;
+                                int sepLeft = (client.right >= padL * 2 + 8) ? padL : 0;
+                                int sepRight = (client.right >= padR * 2 + 8)
+                                    ? client.right - padR : client.right;
+                                RECT sepRect = { sepLeft, sepY, sepRight, sepY + 2 };
+
+                                HBRUSH sepBrush = CreateSolidBrush(g_sepColor);
+                                if (sepBrush)
+                                {
+                                    FillRect(hdc, &sepRect, sepBrush);
+                                    DeleteObject(sepBrush);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -619,44 +685,114 @@ HRESULT THISCALL SetStateImageList_hook(void *pThis, HIMAGELIST himl)
 }
 
 // --- Quick Access item hiding ---
-// Suppresses Desktop/This PC from appearing under Quick Access
-// by hooking CNscTree::_ShouldInsertChild and matching by CLSID
-// in the item's parsing name.
+// Quick Access pinned items bypass all CNscTree insertion predicates
+// (_ShouldInsertChild, _InsertChild) so we can't filter them at
+// insertion time. Instead, on the first WM_PAINT after our items
+// are cached, walk depth-1 items and delete any matching childless
+// duplicates (QA pins have no children; nav pane sections do).
 
-using ShouldInsertChild_t = int (THISCALL *)(
-    void *, HTREEITEM, IShellFolder *, PCUITEMID_CHILD);
-ShouldInsertChild_t ShouldInsertChild_orig;
-
-int THISCALL ShouldInsertChild_hook(
-    void *pThis, HTREEITEM hParent, IShellFolder *psf,
-    PCUITEMID_CHILD pidlChild)
+static void CleanupQuickAccessDuplicates(HWND hTree)
 {
-    if (psf && pidlChild &&
-        (g_settings.hideThisPCFromQuickAccess ||
-         g_settings.hideDesktopFromQuickAccess))
-    {
-        STRRET strret = {};
-        if (SUCCEEDED(psf->GetDisplayNameOf(
-                pidlChild, SHGDN_FORPARSING, &strret)))
-        {
-            WCHAR name[128] = {};
-            StrRetToBufW(&strret, pidlChild, name, ARRAYSIZE(name));
+    if (!g_hCachedThisPC && !g_hCachedDesktop)
+        return;
 
-            if (g_settings.hideThisPCFromQuickAccess &&
-                wcsstr(name, L"{20D04FE0-3AEA-1069-A2D8-08002B30309D}"))
+    WCHAR thisPCText[64] = {};
+    WCHAR desktopText[64] = {};
+
+    if (g_settings.showThisPCAtTop &&
+        g_settings.hideThisPCFromQuickAccess && g_hCachedThisPC)
+    {
+        TVITEMEXW tvi = {};
+        tvi.mask = TVIF_HANDLE | TVIF_TEXT;
+        tvi.hItem = g_hCachedThisPC;
+        tvi.pszText = thisPCText;
+        tvi.cchTextMax = ARRAYSIZE(thisPCText);
+        SendMessageW(hTree, TVM_GETITEMW, 0, (LPARAM)&tvi);
+    }
+
+    if (g_settings.showDesktopAtTop &&
+        g_settings.hideDesktopFromQuickAccess && g_hCachedDesktop)
+    {
+        TVITEMEXW tvi = {};
+        tvi.mask = TVIF_HANDLE | TVIF_TEXT;
+        tvi.hItem = g_hCachedDesktop;
+        tvi.pszText = desktopText;
+        tvi.cchTextMax = ARRAYSIZE(desktopText);
+        SendMessageW(hTree, TVM_GETITEMW, 0, (LPARAM)&tvi);
+    }
+
+    HTREEITEM h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM,
+                                          TVGN_ROOT, 0);
+    if (!h) return;
+
+    // Walk depth-1 items (children of root)
+    h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM,
+                                TVGN_CHILD, (LPARAM)h);
+
+    HTREEITEM toDelete[8] = {};
+    int delCount = 0;
+
+    while (h)
+    {
+        HTREEITEM hNext = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM,
+                                                   TVGN_NEXT, (LPARAM)h);
+        if (h != g_hCachedThisPC && h != g_hCachedDesktop)
+        {
+            HTREEITEM hChild = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM,
+                                                        TVGN_CHILD, (LPARAM)h);
+            if (!hChild)
             {
-                Wh_Log(L"[QA-HIDE] suppressed This PC: %s", name);
-                return 0;
-            }
-            if (g_settings.hideDesktopFromQuickAccess &&
-                wcsstr(name, L"{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"))
-            {
-                Wh_Log(L"[QA-HIDE] suppressed Desktop: %s", name);
-                return 0;
+                WCHAR text[64] = {};
+                TVITEMEXW tvi = {};
+                tvi.mask = TVIF_HANDLE | TVIF_TEXT;
+                tvi.hItem = h;
+                tvi.pszText = text;
+                tvi.cchTextMax = ARRAYSIZE(text);
+                SendMessageW(hTree, TVM_GETITEMW, 0, (LPARAM)&tvi);
+
+                bool match = false;
+                if (thisPCText[0] && wcscmp(text, thisPCText) == 0)
+                    match = true;
+                if (desktopText[0] && wcscmp(text, desktopText) == 0)
+                    match = true;
+
+                if (match && delCount < 8)
+                    toDelete[delCount++] = h;
             }
         }
+        h = hNext;
     }
-    return ShouldInsertChild_orig(pThis, hParent, psf, pidlChild);
+
+    // Only keep a duplicate hidden (paint-over) if it's a section
+    // boundary item (iIntegral>=2) — removing it would destroy the
+    // gap where the separator line goes. All others are safe to delete.
+    g_hiddenDuplicate = nullptr;
+    for (int i = 0; i < delCount; i++)
+    {
+        if (!g_hiddenDuplicate)
+        {
+            TVITEMEXW check = {};
+            check.mask = TVIF_HANDLE | TVIF_INTEGRAL;
+            check.hItem = toDelete[i];
+            SendMessageW(hTree, TVM_GETITEMW, 0, (LPARAM)&check);
+
+            if (check.iIntegral >= 2)
+            {
+                g_hiddenDuplicate = toDelete[i];
+                TVITEMEXW forceSmall = {};
+                forceSmall.mask = TVIF_HANDLE | TVIF_INTEGRAL;
+                forceSmall.hItem = toDelete[i];
+                forceSmall.iIntegral = 1;
+                SendMessageW(hTree, TVM_SETITEMW, 0, (LPARAM)&forceSmall);
+                Wh_Log(L"[QA-HIDE] keeping boundary item=%p invisible (was iIntegral=%d)",
+                       toDelete[i], check.iIntegral);
+                continue;
+            }
+        }
+
+        Wh_Log(L"[QA-HIDE] deleting duplicate item=%p", toDelete[i]);
+        SendMessageW(hTree, TVM_DELETEITEM, 0, (LPARAM)toDelete[i]);
+    }
 }
 
 // --- SubClassTreeWndProc ---
@@ -670,7 +806,7 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
     HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
     UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
-    if (g_insertingItem && (uMsg == TVM_INSERTITEMW || uMsg == TVM_INSERTITEMA))
+    if (uMsg == TVM_INSERTITEMW || uMsg == TVM_INSERTITEMA)
     {
         LRESULT result = SubClassTreeWndProc_orig(hWnd, uMsg, wParam,
                             lParam, uIdSubclass, dwRefData);
@@ -681,44 +817,116 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
             {
                 g_hCachedThisPC = hNew;
                 g_hCachedTree = hWnd;
+                g_qaCleanupDone = false;
                 Wh_Log(L"[CACHE] This PC item=%p tree=%p", hNew, hWnd);
             }
             else if (g_insertingItem == 2)
             {
                 g_hCachedDesktop = hNew;
                 g_hCachedTree = hWnd;
+                g_qaCleanupDone = false;
                 Wh_Log(L"[CACHE] Desktop item=%p tree=%p", hNew, hWnd);
+            }
+            else if (g_qaCleanupDone && g_hCachedTree == hWnd)
+            {
+                HTREEITEM hPar = (HTREEITEM)SendMessageW(hWnd, TVM_GETNEXTITEM,
+                                                          TVGN_PARENT, (LPARAM)hNew);
+                if (hPar)
+                {
+                    HTREEITEM hGP = (HTREEITEM)SendMessageW(hWnd, TVM_GETNEXTITEM,
+                                                              TVGN_PARENT, (LPARAM)hPar);
+                    if (!hGP)
+                    {
+                        g_qaCleanupDone = false;
+                        g_hiddenDuplicate = nullptr;
+                        Wh_Log(L"[QA-HIDE] depth-1 item inserted, scheduling re-cleanup");
+                    }
+                }
             }
         }
         return result;
     }
 
-    // Collapse: if system sets iIntegral=2 on the boundary item between
-    // Desktop and This PC, force it to 1 to remove the extra vertical gap.
-    if (ShouldRemoveSeparators() &&
-        (uMsg == TVM_SETITEMW || uMsg == TVM_SETITEMA))
+    // Block clicks and cursor changes on hidden duplicate
+    if (g_hiddenDuplicate &&
+        (uMsg == WM_LBUTTONDOWN || uMsg == WM_SETCURSOR))
+    {
+        POINT pt;
+        if (uMsg == WM_LBUTTONDOWN)
+        {
+            pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        }
+        else
+        {
+            GetCursorPos(&pt);
+            ScreenToClient(hWnd, &pt);
+        }
+        TVHITTESTINFO ht = {};
+        ht.pt = pt;
+        HTREEITEM hHit = (HTREEITEM)SendMessageW(hWnd, TVM_HITTEST, 0, (LPARAM)&ht);
+        if (hHit == g_hiddenDuplicate)
+        {
+            if (uMsg == WM_LBUTTONDOWN)
+                return 0;
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
+        }
+    }
+
+    // Skip hidden duplicate on keyboard navigation
+    if (uMsg == WM_KEYDOWN && g_hiddenDuplicate &&
+        (wParam == VK_UP || wParam == VK_DOWN))
+    {
+        LRESULT r = SubClassTreeWndProc_orig(hWnd, uMsg, wParam, lParam,
+                                              uIdSubclass, dwRefData);
+        HTREEITEM hSel = (HTREEITEM)SendMessageW(hWnd, TVM_GETNEXTITEM,
+                                                   TVGN_CARET, 0);
+        if (hSel == g_hiddenDuplicate)
+        {
+            UINT dir = (wParam == VK_DOWN) ? TVGN_NEXTVISIBLE : TVGN_PREVIOUSVISIBLE;
+            HTREEITEM hNext = (HTREEITEM)SendMessageW(hWnd, TVM_GETNEXTITEM,
+                                                        dir, (LPARAM)hSel);
+            if (hNext)
+                SendMessageW(hWnd, TVM_SELECTITEM, TVGN_CARET, (LPARAM)hNext);
+        }
+        return r;
+    }
+
+    if (uMsg == TVM_SETITEMW || uMsg == TVM_SETITEMA)
     {
         TVITEMEXW* tvi = (TVITEMEXW*)lParam;
-        if (tvi && (tvi->mask & TVIF_INTEGRAL) && tvi->iIntegral >= 2)
+        if (tvi && (tvi->mask & TVIF_INTEGRAL))
         {
-            HTREEITEM hA = (g_hCachedTree == hWnd) ? g_hCachedThisPC : nullptr;
-            HTREEITEM hB = (g_hCachedTree == hWnd) ? g_hCachedDesktop : nullptr;
-            if (hA && hB)
+            // Keep hidden duplicate at iIntegral=1 so it occupies
+            // exactly one row of space for the painted-over separator.
+            if (g_hiddenDuplicate && tvi->hItem == g_hiddenDuplicate &&
+                tvi->iIntegral != 1)
             {
-                RECT rcA = {}, rcB = {};
-                *(HTREEITEM*)&rcA = hA;
-                *(HTREEITEM*)&rcB = hB;
-                bool gotA = SendMessageW(hWnd, TVM_GETITEMRECT, FALSE, (LPARAM)&rcA);
-                bool gotB = SendMessageW(hWnd, TVM_GETITEMRECT, FALSE, (LPARAM)&rcB);
+                tvi->iIntegral = 1;
+            }
 
-                if (gotA && gotB)
+            // Collapse the boundary between Desktop and This PC.
+            if (ShouldRemoveSeparators() && tvi->iIntegral >= 2)
+            {
+                HTREEITEM hA = (g_hCachedTree == hWnd) ? g_hCachedThisPC : nullptr;
+                HTREEITEM hB = (g_hCachedTree == hWnd) ? g_hCachedDesktop : nullptr;
+                if (hA && hB)
                 {
-                    HTREEITEM hLower = (rcA.top > rcB.top) ? hA : hB;
-                    if (tvi->hItem == hLower)
+                    RECT rcA = {}, rcB = {};
+                    *(HTREEITEM*)&rcA = hA;
+                    *(HTREEITEM*)&rcB = hB;
+                    bool gotA = SendMessageW(hWnd, TVM_GETITEMRECT, FALSE, (LPARAM)&rcA);
+                    bool gotB = SendMessageW(hWnd, TVM_GETITEMRECT, FALSE, (LPARAM)&rcB);
+
+                    if (gotA && gotB)
                     {
-                        Wh_Log(L"[SEP-COLLAPSE] TVM_SETITEMW: iIntegral %d->1 on item=%p",
-                               tvi->iIntegral, tvi->hItem);
-                        tvi->iIntegral = 1;
+                        HTREEITEM hLower = (rcA.top > rcB.top) ? hA : hB;
+                        if (tvi->hItem == hLower)
+                        {
+                            Wh_Log(L"[SEP-COLLAPSE] TVM_SETITEMW: iIntegral %d->1 on item=%p",
+                                   tvi->iIntegral, tvi->hItem);
+                            tvi->iIntegral = 1;
+                        }
                     }
                 }
             }
@@ -727,6 +935,14 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
 
     if (uMsg == WM_PAINT)
     {
+        if (!g_qaCleanupDone && g_hCachedTree == hWnd &&
+            ((g_settings.showThisPCAtTop && g_settings.hideThisPCFromQuickAccess) ||
+             (g_settings.showDesktopAtTop && g_settings.hideDesktopFromQuickAccess)))
+        {
+            g_qaCleanupDone = true;
+            CleanupQuickAccessDuplicates(hWnd);
+        }
+
         if (g_settings.hidePinButtons)
         {
             HIMAGELIST hState = (HIMAGELIST)SendMessageW(
@@ -735,7 +951,7 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
                 SendMessageW(hWnd, TVM_SETIMAGELIST, TVSIL_STATE, 0);
         }
 
-        if (ShouldRemoveSeparators())
+        if (ShouldRemoveSeparators() || g_hiddenDuplicate)
             EnsureParentSubclass(hWnd);
 
         if (g_settings.fixChevronDrawing)
@@ -828,7 +1044,7 @@ BOOL Wh_ModInit()
     if (!g_pidlDesktop)
         Wh_Log(L"Warning: failed to get Desktop PIDL");
 
-    WindhawkUtils::SYMBOL_HOOK hooks[] = {
+    WindhawkUtils::SYMBOL_HOOK explorerFrameDllHooks[] = {
         {
             {
                 L"public: virtual long __cdecl"
@@ -867,21 +1083,9 @@ BOOL Wh_ModInit()
             SetStateImageList_hook,
             false
         },
-        {
-            {
-                L"private: int __cdecl"
-                L" CNscTree::_ShouldInsertChild("
-                L"struct _TREEITEM *,"
-                L"struct IShellFolder *,"
-                L"struct _ITEMID_CHILD const __unaligned *)"
-            },
-            &ShouldInsertChild_orig,
-            ShouldInsertChild_hook,
-            false
-        }
     };
 
-    if (!WindhawkUtils::HookSymbols(hExplorerFrame, hooks, ARRAYSIZE(hooks)))
+    if (!WindhawkUtils::HookSymbols(hExplorerFrame, explorerFrameDllHooks, ARRAYSIZE(explorerFrameDllHooks)))
     {
         Wh_Log(L"Failed to hook symbols");
         return FALSE;
@@ -932,5 +1136,6 @@ void Wh_ModUninit()
     g_hCachedThisPC = nullptr;
     g_hCachedDesktop = nullptr;
     g_hCachedTree = nullptr;
+    g_hiddenDuplicate = nullptr;
     Wh_Log(L"Mod uninitialized");
 }
