@@ -47,43 +47,44 @@ Home and Gallery are already hidden using other tweaks.
 
 // ==WindhawkModSettings==
 /*
-- showThisPCAtTop: true
-  $name: Show This PC at top
-  $description: Adds This PC to the top of the navigation pane
-- thisPCSortOrder: 0
-  $name: This PC sort order
-  $description: Relative position among added items (lower = higher in nav pane)
-- thisPCExpandable: true
-  $name: Make This PC expandable
-  $description: Shows drives underneath This PC when expanded
-- thisPCStartExpanded: true
-  $name: Start with This PC expanded
-  $description: Start with This PC node expanded
-- showDesktopAtTop: false
-  $name: Show Desktop at top
-  $description: Adds the Desktop namespace root to the top of the navigation pane
-- desktopSortOrder: 1
-  $name: Desktop sort order
-  $description: Relative position among added items (lower = higher in nav pane)
-- desktopExpandable: false
-  $name: Make Desktop expandable
-  $description: Shows Desktop namespace children when expanded
-- removeExtraSeparators: true
-  $name: Remove extra separators
-  $description: >-
-    Paints over separator lines that appear between custom items
-    when they end up in separate nav pane sections.
-- fixChevronDrawing: true
-  $name: Fix chevron drawing
-  $description: >-
-    Replaces theme-drawn expand/collapse chevrons with custom
-    anti-aliased ones (fixes clipping at non-standard DPI like 225%)
-- chevronScale: 0
-  $name: Chevron scale (%)
-  $description: >-
-    Size of expand/collapse chevrons. 0 or 100 = default size,
-    125 = 25% larger. Negative = absolute pixel size (-20 = 20×20 px).
-    Only applies when Fix chevron drawing is enabled.
+- ThisPC:
+  - showThisPCAtTop: true
+    $name: Show This PC at top
+    $description: Adds This PC to the top of the navigation pane
+  - thisPCSortOrder: 0
+    $name: This PC sort order
+    $description: Relative position among added items (lower = higher in nav pane)
+  - thisPCExpandable: true
+    $name: Make This PC expandable
+    $description: Shows drives underneath This PC when expanded
+  - thisPCStartExpanded: true
+    $name: Start with This PC expanded
+    $description: Start with This PC node expanded
+  $name: This PC
+- Desktop:
+  - showDesktopAtTop: false
+    $name: Show Desktop at top
+    $description: Adds the Desktop namespace root to the top of the navigation pane
+  - desktopSortOrder: 1
+    $name: Desktop sort order
+    $description: Relative position among added items (lower = higher in nav pane)
+  - desktopExpandable: false
+    $name: Make Desktop expandable
+    $description: Shows Desktop namespace children when expanded
+  $name: Desktop
+- Chevrons:
+  - fixChevronDrawing: true
+    $name: Fix chevron drawing
+    $description: >-
+      Replaces theme-drawn expand/collapse chevrons with custom
+      anti-aliased ones (fixes clipping at non-standard DPI like 225%)
+  - chevronScale: 0
+    $name: Chevron scale (%)
+    $description: >-
+      Size of expand/collapse chevrons. 0 or 100 = default size,
+      125 = 25% larger. Negative = absolute pixel size (-20 = 20×20 px).
+      Only applies when Fix chevron drawing is enabled.
+  $name: Chevrons
 */
 // ==/WindhawkModSettings==
 
@@ -109,7 +110,6 @@ struct {
     bool showDesktopAtTop;
     int desktopSortOrder;
     bool desktopExpandable;
-    bool removeExtraSeparators;
     bool fixChevronDrawing;
     int chevronScale;
 } g_settings;
@@ -119,6 +119,15 @@ static PIDLIST_ABSOLUTE g_pidlDesktop = nullptr;
 static ULONG_PTR g_gdipToken = 0;
 static std::set<HWND> g_subclassedParents;
 static COLORREF g_sepColor = CLR_INVALID;
+static HTREEITEM g_hCachedThisPC = nullptr;
+static HTREEITEM g_hCachedDesktop = nullptr;
+static HWND g_hCachedTree = nullptr;
+
+static bool ShouldRemoveSeparators()
+{
+    return g_settings.showThisPCAtTop && g_settings.showDesktopAtTop &&
+           g_settings.desktopSortOrder < g_settings.thisPCSortOrder;
+}
 
 // Rejects all children so a root appears as a flat clickable
 // leaf rather than an expandable container.
@@ -316,27 +325,6 @@ static thread_local bool g_inTreePaint = false;
 // separator lines. At CDDS_POSTPAINT we redraw the ones we want to
 // keep — all section boundaries EXCEPT the one between our custom items.
 
-static HTREEITEM FindVisibleItemByText(HWND hTree, const WCHAR *target)
-{
-    HTREEITEM h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM,
-                                          TVGN_FIRSTVISIBLE, 0);
-    while (h)
-    {
-        WCHAR text[64] = {};
-        TVITEMEXW tvi = {};
-        tvi.mask = TVIF_HANDLE | TVIF_TEXT;
-        tvi.hItem = h;
-        tvi.pszText = text;
-        tvi.cchTextMax = ARRAYSIZE(text);
-        SendMessageW(hTree, TVM_GETITEMW, 0, (LPARAM)&tvi);
-        if (wcscmp(text, target) == 0)
-            return h;
-        h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM,
-                                    TVGN_NEXTVISIBLE, (LPARAM)h);
-    }
-    return nullptr;
-}
-
 // Sample the separator line color from the DC. Called on the first
 // paint cycle when CDDS_PREPAINT was NOT swallowed (separators visible).
 static COLORREF SampleSeparatorColor(HWND hTree, HDC hdc)
@@ -433,10 +421,8 @@ static void RedrawOtherSeparators(HWND hTree, HDC hdc)
     if (client.right <= 0 || client.bottom <= 0)
         return;
 
-    HTREEITEM hThisPC = g_settings.showThisPCAtTop ?
-                        FindVisibleItemByText(hTree, L"This PC") : nullptr;
-    HTREEITEM hDesktop = g_settings.showDesktopAtTop ?
-                         FindVisibleItemByText(hTree, L"Desktop") : nullptr;
+    HTREEITEM hThisPC = (g_hCachedTree == hTree) ? g_hCachedThisPC : nullptr;
+    HTREEITEM hDesktop = (g_hCachedTree == hTree) ? g_hCachedDesktop : nullptr;
 
     int baseHeight = 0;
     HTREEITEM h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM,
@@ -586,7 +572,7 @@ static LRESULT CALLBACK SepParentSubclassProc(
                             InvalidateRect(hTree, NULL, TRUE);
                         }
                     }
-                    if (g_settings.removeExtraSeparators && g_sepColor != CLR_INVALID)
+                    if (ShouldRemoveSeparators() && g_sepColor != CLR_INVALID)
                         RedrawOtherSeparators(hTree, cd->nmcd.hdc);
                 }
             }
@@ -602,6 +588,12 @@ static LRESULT CALLBACK SepParentSubclassProc(
                 return r;
             }
         }
+    }
+
+    if (uMsg == WM_THEMECHANGED || uMsg == WM_SYSCOLORCHANGE)
+    {
+        g_sepColor = CLR_INVALID;
+        Wh_Log(L"[SEP-COLOR] theme/colors changed, will resample");
     }
 
     if (uMsg == WM_NCDESTROY)
@@ -638,18 +630,49 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
     HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
     UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
+    // Cache HTREEITEMs at insertion time so we don't walk
+    // visible items by text on every paint/setitem.
+    if (uMsg == TVM_INSERTITEMW || uMsg == TVM_INSERTITEMA)
+    {
+        LRESULT result = SubClassTreeWndProc_orig(hWnd, uMsg, wParam,
+                            lParam, uIdSubclass, dwRefData);
+        HTREEITEM hNew = (HTREEITEM)result;
+        if (hNew)
+        {
+            WCHAR text[64] = {};
+            TVITEMEXW tvi = {};
+            tvi.mask = TVIF_HANDLE | TVIF_TEXT;
+            tvi.hItem = hNew;
+            tvi.pszText = text;
+            tvi.cchTextMax = ARRAYSIZE(text);
+            SendMessageW(hWnd, TVM_GETITEMW, 0, (LPARAM)&tvi);
+
+            if (wcscmp(text, L"This PC") == 0)
+            {
+                g_hCachedThisPC = hNew;
+                g_hCachedTree = hWnd;
+                Wh_Log(L"[CACHE] This PC item=%p tree=%p", hNew, hWnd);
+            }
+            else if (wcscmp(text, L"Desktop") == 0)
+            {
+                g_hCachedDesktop = hNew;
+                g_hCachedTree = hWnd;
+                Wh_Log(L"[CACHE] Desktop item=%p tree=%p", hNew, hWnd);
+            }
+        }
+        return result;
+    }
+
     // Collapse: if system sets iIntegral=2 on the boundary item between
     // Desktop and This PC, force it to 1 to remove the extra vertical gap.
-    if (g_settings.removeExtraSeparators &&
+    if (ShouldRemoveSeparators() &&
         (uMsg == TVM_SETITEMW || uMsg == TVM_SETITEMA))
     {
         TVITEMEXW* tvi = (TVITEMEXW*)lParam;
         if (tvi && (tvi->mask & TVIF_INTEGRAL) && tvi->iIntegral >= 2)
         {
-            HTREEITEM hA = g_settings.showThisPCAtTop ?
-                           FindVisibleItemByText(hWnd, L"This PC") : nullptr;
-            HTREEITEM hB = g_settings.showDesktopAtTop ?
-                           FindVisibleItemByText(hWnd, L"Desktop") : nullptr;
+            HTREEITEM hA = (g_hCachedTree == hWnd) ? g_hCachedThisPC : nullptr;
+            HTREEITEM hB = (g_hCachedTree == hWnd) ? g_hCachedDesktop : nullptr;
             if (hA && hB)
             {
                 RECT rcA = {}, rcB = {};
@@ -674,7 +697,7 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
 
     if (uMsg == WM_PAINT)
     {
-        if (g_settings.removeExtraSeparators)
+        if (ShouldRemoveSeparators())
             EnsureParentSubclass(hWnd);
 
         if (g_settings.fixChevronDrawing)
@@ -716,24 +739,27 @@ HRESULT WINAPI DrawThemeBackground_hook(
 
 void LoadSettings()
 {
-    g_settings.showThisPCAtTop = Wh_GetIntSetting(L"showThisPCAtTop");
-    g_settings.thisPCSortOrder = Wh_GetIntSetting(L"thisPCSortOrder");
-    g_settings.thisPCExpandable = Wh_GetIntSetting(L"thisPCExpandable");
-    g_settings.thisPCStartExpanded = Wh_GetIntSetting(L"thisPCStartExpanded");
-    g_settings.showDesktopAtTop = Wh_GetIntSetting(L"showDesktopAtTop");
-    g_settings.desktopSortOrder = Wh_GetIntSetting(L"desktopSortOrder");
-    g_settings.desktopExpandable = Wh_GetIntSetting(L"desktopExpandable");
-    g_settings.removeExtraSeparators = Wh_GetIntSetting(L"removeExtraSeparators");
-    g_settings.fixChevronDrawing = Wh_GetIntSetting(L"fixChevronDrawing");
-    g_settings.chevronScale = Wh_GetIntSetting(L"chevronScale");
+    g_settings.showThisPCAtTop = Wh_GetIntSetting(L"ThisPC.showThisPCAtTop");
+    g_settings.thisPCSortOrder = Wh_GetIntSetting(L"ThisPC.thisPCSortOrder");
+    g_settings.thisPCExpandable = Wh_GetIntSetting(L"ThisPC.thisPCExpandable");
+    g_settings.thisPCStartExpanded = Wh_GetIntSetting(L"ThisPC.thisPCStartExpanded");
+    g_settings.showDesktopAtTop = Wh_GetIntSetting(L"Desktop.showDesktopAtTop");
+    g_settings.desktopSortOrder = Wh_GetIntSetting(L"Desktop.desktopSortOrder");
+    g_settings.desktopExpandable = Wh_GetIntSetting(L"Desktop.desktopExpandable");
+    g_settings.fixChevronDrawing = Wh_GetIntSetting(L"Chevrons.fixChevronDrawing");
+    g_settings.chevronScale = Wh_GetIntSetting(L"Chevrons.chevronScale");
+
+    // Force resample on next paint — handles theme/dark-mode changes.
+    g_sepColor = CLR_INVALID;
+
     Wh_Log(L"Settings: thisPCAtTop=%d (sort=%d, expand=%d, startExp=%d) "
             L"desktopAtTop=%d (sort=%d, expand=%d) "
-            L"removeSep=%d fixChevron=%d chevronScale=%d",
+            L"sepRemoval=%d fixChevron=%d chevronScale=%d",
             g_settings.showThisPCAtTop, g_settings.thisPCSortOrder,
             g_settings.thisPCExpandable, g_settings.thisPCStartExpanded,
             g_settings.showDesktopAtTop, g_settings.desktopSortOrder,
             g_settings.desktopExpandable,
-            g_settings.removeExtraSeparators,
+            ShouldRemoveSeparators(),
             g_settings.fixChevronDrawing,
             g_settings.chevronScale);
 }
@@ -843,5 +869,8 @@ void Wh_ModUninit()
             WindhawkUtils::RemoveWindowSubclassFromAnyThread(parent, SepParentSubclassProc);
     }
     g_subclassedParents.clear();
+    g_hCachedThisPC = nullptr;
+    g_hCachedDesktop = nullptr;
+    g_hCachedTree = nullptr;
     Wh_Log(L"Mod uninitialized");
 }
