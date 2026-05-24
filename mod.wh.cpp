@@ -117,8 +117,6 @@ struct {
 static PIDLIST_ABSOLUTE g_pidlThisPC = nullptr;
 static PIDLIST_ABSOLUTE g_pidlDesktop = nullptr;
 static ULONG_PTR g_gdipToken = 0;
-static HWND g_lastTreeHwnd = nullptr;
-static bool g_sepCollapsed = false;
 static std::set<HWND> g_subclassedParents;
 static COLORREF g_sepColor = CLR_INVALID;
 
@@ -202,9 +200,6 @@ HRESULT THISCALL AppendRoot_hook(
     bool isHiddenRoot = (grfRootStyle & 0x1) != 0;
     bool wantItems = isHiddenRoot &&
         (g_settings.showThisPCAtTop || g_settings.showDesktopAtTop);
-
-    if (isHiddenRoot)
-        g_sepCollapsed = false;
 
     HRESULT hr = AppendRoot_orig(pThis, psiRoot, grfEnumFlags,
                                  grfRootStyle, pFilter);
@@ -320,8 +315,6 @@ static thread_local bool g_inTreePaint = false;
 // CDRF_NOTIFYPOSTPAINT without calling DefSubclassProc) hides ALL
 // separator lines. At CDDS_POSTPAINT we redraw the ones we want to
 // keep — all section boundaries EXCEPT the one between our custom items.
-
-static thread_local bool g_inSepFix = false;
 
 static HTREEITEM FindVisibleItemByText(HWND hTree, const WCHAR *target)
 {
@@ -645,11 +638,9 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
     HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam,
     UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
-    g_lastTreeHwnd = hWnd;
-
     // Collapse: if system sets iIntegral=2 on the boundary item between
     // Desktop and This PC, force it to 1 to remove the extra vertical gap.
-    if (g_settings.removeExtraSeparators && !g_inSepFix &&
+    if (g_settings.removeExtraSeparators &&
         (uMsg == TVM_SETITEMW || uMsg == TVM_SETITEMA))
     {
         TVITEMEXW* tvi = (TVITEMEXW*)lParam;
@@ -675,7 +666,6 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
                         Wh_Log(L"[SEP-COLLAPSE] TVM_SETITEMW: iIntegral %d->1 on item=%p",
                                tvi->iIntegral, tvi->hItem);
                         tvi->iIntegral = 1;
-                        g_sepCollapsed = true;
                     }
                 }
             }
