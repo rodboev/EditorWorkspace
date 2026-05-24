@@ -6,7 +6,7 @@
 // @author          Rod
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lole32 -lshell32 -luuid -luxtheme -lgdi32 -lgdiplus -lcomctl32
+// @compilerOptions -lole32 -lshell32 -lshlwapi -luuid -luxtheme -lgdi32 -lgdiplus -lcomctl32
 // @license         MIT
 // ==/WindhawkMod==
 
@@ -57,6 +57,11 @@ Home and Gallery are already hidden using other tweaks.
   - thisPCStartExpanded: true
     $name: Start expanded
     $description: Auto-expand This PC when window opens
+  - hideThisPCFromQuickAccess: true
+    $name: Hide from Quick Access
+    $description: >-
+      Hides This PC if it appears under Quick Access (e.g. if pinned).
+      Useful when it is already added to the top by this mod.
   $name: This PC
 - Desktop:
   - showDesktopAtTop: false
@@ -68,6 +73,11 @@ Home and Gallery are already hidden using other tweaks.
   - desktopAboveThisPC: true
     $name: Place above This PC
     $description: Disable if there are issues with separator lines.
+  - hideDesktopFromQuickAccess: true
+    $name: Hide from Quick Access
+    $description: >-
+      Hides Desktop if it appears under Quick Access (e.g. if pinned).
+      Useful when it is already added to the top by this mod.
   $name: Desktop
 - Resources:
   - fixChevronDrawing: true
@@ -93,6 +103,7 @@ Home and Gallery are already hidden using other tweaks.
 #include <windhawk_api.h>
 #include <windhawk_utils.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <commctrl.h>
 #include <uxtheme.h>
 #include <gdiplus.h>
@@ -108,9 +119,11 @@ struct {
     bool showThisPCAtTop;
     bool thisPCExpandable;
     bool thisPCStartExpanded;
+    bool hideThisPCFromQuickAccess;
     bool showDesktopAtTop;
     bool desktopAboveThisPC;
     bool desktopExpandable;
+    bool hideDesktopFromQuickAccess;
     bool fixChevronDrawing;
     int chevronScale;
     bool hidePinButtons;
@@ -136,36 +149,6 @@ static bool ShouldRemoveSeparators()
            g_settings.desktopAboveThisPC;
 }
 
-// Rejects all children so a root appears as a flat clickable
-// leaf rather than an expandable container.
-class CRejectAllFilter : public IShellItemFilter {
-    LONG m_ref;
-public:
-    CRejectAllFilter() : m_ref(1) {}
-    STDMETHODIMP QueryInterface(REFIID riid, void **ppv) override {
-        if (riid == IID_IUnknown || riid == IID_IShellItemFilter) {
-            *ppv = static_cast<IShellItemFilter *>(this);
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-    STDMETHODIMP_(ULONG) AddRef() override {
-        return InterlockedIncrement(&m_ref);
-    }
-    STDMETHODIMP_(ULONG) Release() override {
-        ULONG ref = InterlockedDecrement(&m_ref);
-        if (ref == 0) delete this;
-        return ref;
-    }
-    STDMETHODIMP IncludeItem(IShellItem *) override { return S_FALSE; }
-    STDMETHODIMP GetEnumFlagsForItem(IShellItem *, SHCONTF *pgrfFlags) override {
-        *pgrfFlags = 0;
-        return S_OK;
-    }
-};
-
 // --- AppendRoot hook ---
 
 using AppendRoot_t = HRESULT (THISCALL *)(
@@ -188,20 +171,14 @@ static void AppendOneItem(
     if (FAILED(SHCreateItemFromIDList(pidl, IID_IShellItem, (void **)&pItem)))
         return;
 
-    CRejectAllFilter *pRejectFilter = nullptr;
-    if (!expandable)
-        pRejectFilter = new CRejectAllFilter();
-
     HRESULT hr = AppendRoot_orig(pThis, pItem,
         expandable ? grfEnumFlags : 0,
         rootStyle,
-        pRejectFilter ? (IShellItemFilter *)pRejectFilter : pOrigFilter);
+        pOrigFilter);
 
     Wh_Log(L"AppendRoot: %s (%s) rootStyle=0x%lx result=0x%lx",
             label, expandable ? L"expandable" : L"leaf", rootStyle, hr);
 
-    if (pRejectFilter)
-        pRejectFilter->Release();
     pItem->Release();
 }
 
@@ -630,9 +607,6 @@ static void EnsureParentSubclass(HWND hTree)
 }
 
 // --- Pin button hiding ---
-// Blocks the state image list (pin icons) from being set on the tree.
-// Two mechanisms: (1) hook CNscTree::SetStateImageList to prevent it,
-// (2) strip it in SubClassTreeWndProc on WM_PAINT for already-set trees.
 
 using SetStateImageList_t = HRESULT (THISCALL *)(void *, HIMAGELIST);
 SetStateImageList_t SetStateImageList_orig;
@@ -642,6 +616,47 @@ HRESULT THISCALL SetStateImageList_hook(void *pThis, HIMAGELIST himl)
     if (g_settings.hidePinButtons)
         return S_OK;
     return SetStateImageList_orig(pThis, himl);
+}
+
+// --- Quick Access item hiding ---
+// Suppresses Desktop/This PC from appearing under Quick Access
+// by hooking CNscTree::_ShouldInsertChild and matching by CLSID
+// in the item's parsing name.
+
+using ShouldInsertChild_t = int (THISCALL *)(
+    void *, HTREEITEM, IShellFolder *, PCUITEMID_CHILD);
+ShouldInsertChild_t ShouldInsertChild_orig;
+
+int THISCALL ShouldInsertChild_hook(
+    void *pThis, HTREEITEM hParent, IShellFolder *psf,
+    PCUITEMID_CHILD pidlChild)
+{
+    if (psf && pidlChild &&
+        (g_settings.hideThisPCFromQuickAccess ||
+         g_settings.hideDesktopFromQuickAccess))
+    {
+        STRRET strret = {};
+        if (SUCCEEDED(psf->GetDisplayNameOf(
+                pidlChild, SHGDN_FORPARSING, &strret)))
+        {
+            WCHAR name[128] = {};
+            StrRetToBufW(&strret, pidlChild, name, ARRAYSIZE(name));
+
+            if (g_settings.hideThisPCFromQuickAccess &&
+                wcsstr(name, L"{20D04FE0-3AEA-1069-A2D8-08002B30309D}"))
+            {
+                Wh_Log(L"[QA-HIDE] suppressed This PC: %s", name);
+                return 0;
+            }
+            if (g_settings.hideDesktopFromQuickAccess &&
+                wcsstr(name, L"{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"))
+            {
+                Wh_Log(L"[QA-HIDE] suppressed Desktop: %s", name);
+                return 0;
+            }
+        }
+    }
+    return ShouldInsertChild_orig(pThis, hParent, psf, pidlChild);
 }
 
 // --- SubClassTreeWndProc ---
@@ -765,22 +780,26 @@ void LoadSettings()
     g_settings.showThisPCAtTop = Wh_GetIntSetting(L"ThisPC.showThisPCAtTop");
     g_settings.thisPCExpandable = Wh_GetIntSetting(L"ThisPC.thisPCExpandable");
     g_settings.thisPCStartExpanded = Wh_GetIntSetting(L"ThisPC.thisPCStartExpanded");
+    g_settings.hideThisPCFromQuickAccess = Wh_GetIntSetting(L"ThisPC.hideThisPCFromQuickAccess");
     g_settings.showDesktopAtTop = Wh_GetIntSetting(L"Desktop.showDesktopAtTop");
     g_settings.desktopAboveThisPC = Wh_GetIntSetting(L"Desktop.desktopAboveThisPC");
     g_settings.desktopExpandable = Wh_GetIntSetting(L"Desktop.desktopExpandable");
+    g_settings.hideDesktopFromQuickAccess = Wh_GetIntSetting(L"Desktop.hideDesktopFromQuickAccess");
     g_settings.fixChevronDrawing = Wh_GetIntSetting(L"Resources.fixChevronDrawing");
     g_settings.chevronScale = Wh_GetIntSetting(L"Resources.chevronScale");
     g_settings.hidePinButtons = Wh_GetIntSetting(L"Resources.hidePinButtons");
 
     g_sepColor = CLR_INVALID;
 
-    Wh_Log(L"Settings: thisPCAtTop=%d (expand=%d, startExp=%d) "
-            L"desktopAtTop=%d (above=%d, expand=%d) "
+    Wh_Log(L"Settings: thisPCAtTop=%d (expand=%d, startExp=%d, hideQA=%d) "
+            L"desktopAtTop=%d (above=%d, expand=%d, hideQA=%d) "
             L"sepRemoval=%d fixChevron=%d chevronScale=%d hidePins=%d",
             g_settings.showThisPCAtTop,
             g_settings.thisPCExpandable, g_settings.thisPCStartExpanded,
+            g_settings.hideThisPCFromQuickAccess,
             g_settings.showDesktopAtTop, g_settings.desktopAboveThisPC,
             g_settings.desktopExpandable,
+            g_settings.hideDesktopFromQuickAccess,
             ShouldRemoveSeparators(),
             g_settings.fixChevronDrawing,
             g_settings.chevronScale,
@@ -789,6 +808,10 @@ void LoadSettings()
 
 BOOL Wh_ModInit()
 {
+    HMODULE hExplorerFrame = GetModuleHandleW(L"ExplorerFrame.dll");
+    if (!hExplorerFrame)
+        return FALSE;
+
     LoadSettings();
 
     Gdiplus::GdiplusStartupInput gdipIn;
@@ -804,14 +827,6 @@ BOOL Wh_ModInit()
     SHGetSpecialFolderLocation(nullptr, CSIDL_DESKTOP, &g_pidlDesktop);
     if (!g_pidlDesktop)
         Wh_Log(L"Warning: failed to get Desktop PIDL");
-
-    HMODULE hExplorerFrame = LoadLibraryExW(
-        L"ExplorerFrame.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!hExplorerFrame)
-    {
-        Wh_Log(L"Failed to load ExplorerFrame.dll");
-        return FALSE;
-    }
 
     WindhawkUtils::SYMBOL_HOOK hooks[] = {
         {
@@ -850,6 +865,18 @@ BOOL Wh_ModInit()
             },
             &SetStateImageList_orig,
             SetStateImageList_hook,
+            false
+        },
+        {
+            {
+                L"private: int __cdecl"
+                L" CNscTree::_ShouldInsertChild("
+                L"struct _TREEITEM *,"
+                L"struct IShellFolder *,"
+                L"struct _ITEMID_CHILD const __unaligned *)"
+            },
+            &ShouldInsertChild_orig,
+            ShouldInsertChild_hook,
             false
         }
     };
