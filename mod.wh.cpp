@@ -818,6 +818,7 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
                 g_hCachedThisPC = hNew;
                 g_hCachedTree = hWnd;
                 g_qaCleanupDone = false;
+                g_hiddenDuplicate = nullptr;
                 Wh_Log(L"[CACHE] This PC item=%p tree=%p", hNew, hWnd);
             }
             else if (g_insertingItem == 2)
@@ -825,6 +826,7 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
                 g_hCachedDesktop = hNew;
                 g_hCachedTree = hWnd;
                 g_qaCleanupDone = false;
+                g_hiddenDuplicate = nullptr;
                 Wh_Log(L"[CACHE] Desktop item=%p tree=%p", hNew, hWnd);
             }
             else if (g_qaCleanupDone && g_hCachedTree == hWnd)
