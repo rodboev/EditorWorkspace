@@ -788,14 +788,17 @@ static bool CleanupQuickAccessDuplicates(HWND hTree)
         h = hNext;
     }
 
-    // Only keep a duplicate hidden (paint-over) if it's a section
-    // boundary item (iIntegral>=2) — removing it would destroy the
-    // gap where the separator line goes. All others are safe to delete.
+    // Keep the first duplicate as g_hiddenDuplicate — painted over at
+    // CDDS_POSTPAINT with a separator line drawn through it. If it's a
+    // section boundary (iIntegral>=2), shrink it to 1 so it doesn't
+    // create excess padding. Delete all others.
     g_hiddenDuplicate = nullptr;
     for (int i = 0; i < delCount; i++)
     {
         if (!g_hiddenDuplicate)
         {
+            g_hiddenDuplicate = toDelete[i];
+
             TVITEMEXW check = {};
             check.mask = TVIF_HANDLE | TVIF_INTEGRAL;
             check.hItem = toDelete[i];
@@ -803,16 +806,15 @@ static bool CleanupQuickAccessDuplicates(HWND hTree)
 
             if (check.iIntegral >= 2)
             {
-                g_hiddenDuplicate = toDelete[i];
                 TVITEMEXW forceSmall = {};
                 forceSmall.mask = TVIF_HANDLE | TVIF_INTEGRAL;
                 forceSmall.hItem = toDelete[i];
                 forceSmall.iIntegral = 1;
                 SendMessageW(hTree, TVM_SETITEMW, 0, (LPARAM)&forceSmall);
-                Wh_Log(L"[QA-HIDE] keeping boundary item=%p invisible (was iIntegral=%d)",
-                       toDelete[i], check.iIntegral);
-                continue;
             }
+            Wh_Log(L"[QA-HIDE] keeping boundary item=%p invisible (was iIntegral=%d)",
+                   toDelete[i], check.iIntegral);
+            continue;
         }
 
         Wh_Log(L"[QA-HIDE] deleting duplicate item=%p", toDelete[i]);
