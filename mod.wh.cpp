@@ -69,7 +69,7 @@ Home and Gallery are already hidden using other tweaks.
     $name: Place above This PC
     $description: Disable if there are issues with separator lines.
   $name: Desktop
-- Chevrons:
+- Resources:
   - fixChevronDrawing: true
     $name: Fix chevron drawing
     $description: >-
@@ -81,7 +81,12 @@ Home and Gallery are already hidden using other tweaks.
       Size of expand/collapse chevrons. 0 or 100 = default size,
       125 = 25% larger. Negative = absolute pixel size (-20 = 20×20 px).
       Only applies when Fix chevron drawing is enabled.
-  $name: Chevrons
+  - hidePinButtons: true
+    $name: Hide pin buttons
+    $description: >-
+      Hides the gray pin icons next to Quick Access items
+      in the navigation pane.
+  $name: Resources
 */
 // ==/WindhawkModSettings==
 
@@ -108,6 +113,7 @@ struct {
     bool desktopExpandable;
     bool fixChevronDrawing;
     int chevronScale;
+    bool hidePinButtons;
 } g_settings;
 
 static PIDLIST_ABSOLUTE g_pidlThisPC = nullptr;
@@ -549,7 +555,7 @@ static LRESULT CALLBACK SepParentSubclassProc(
         LPNMHDR hdr = (LPNMHDR)lParam;
         if (hdr && hdr->hwndFrom == hTree)
         {
-            if (hdr->code == (UINT)NM_CUSTOMDRAW)
+            if (hdr->code == (UINT)NM_CUSTOMDRAW && ShouldRemoveSeparators())
             {
                 LPNMTVCUSTOMDRAW cd = (LPNMTVCUSTOMDRAW)lParam;
                 DWORD stage = cd->nmcd.dwDrawStage;
@@ -558,8 +564,6 @@ static LRESULT CALLBACK SepParentSubclassProc(
                 {
                     if (g_sepColor == CLR_INVALID)
                     {
-                        // First paint: let separators draw normally
-                        // so we can sample their color at POSTPAINT.
                         LRESULT r = DefSubclassProc(hWnd, uMsg, wParam, lParam);
                         return r | CDRF_NOTIFYPOSTPAINT;
                     }
@@ -575,12 +579,10 @@ static LRESULT CALLBACK SepParentSubclassProc(
                         {
                             g_sepColor = c;
                             Wh_Log(L"[SEP-COLOR] captured separator color: 0x%06X", c);
-                            // Now that we have the color, trigger a full
-                            // repaint so separators get hidden properly.
                             InvalidateRect(hTree, NULL, TRUE);
                         }
                     }
-                    if (ShouldRemoveSeparators() && g_sepColor != CLR_INVALID)
+                    if (g_sepColor != CLR_INVALID)
                         RedrawOtherSeparators(hTree, cd->nmcd.hdc);
                 }
             }
@@ -625,6 +627,21 @@ static void EnsureParentSubclass(HWND hTree)
     Wh_Log(L"[SEP-PARENT] subclass on parent=%p for tree=%p ok=%d", parent, hTree, ok);
     if (ok)
         g_subclassedParents.insert(parent);
+}
+
+// --- Pin button hiding ---
+// Blocks the state image list (pin icons) from being set on the tree.
+// Two mechanisms: (1) hook CNscTree::SetStateImageList to prevent it,
+// (2) strip it in SubClassTreeWndProc on WM_PAINT for already-set trees.
+
+using SetStateImageList_t = HRESULT (THISCALL *)(void *, HIMAGELIST);
+SetStateImageList_t SetStateImageList_orig;
+
+HRESULT THISCALL SetStateImageList_hook(void *pThis, HIMAGELIST himl)
+{
+    if (g_settings.hidePinButtons)
+        return S_OK;
+    return SetStateImageList_orig(pThis, himl);
 }
 
 // --- SubClassTreeWndProc ---
@@ -695,6 +712,14 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
 
     if (uMsg == WM_PAINT)
     {
+        if (g_settings.hidePinButtons)
+        {
+            HIMAGELIST hState = (HIMAGELIST)SendMessageW(
+                hWnd, TVM_GETIMAGELIST, TVSIL_STATE, 0);
+            if (hState)
+                SendMessageW(hWnd, TVM_SETIMAGELIST, TVSIL_STATE, 0);
+        }
+
         if (ShouldRemoveSeparators())
             EnsureParentSubclass(hWnd);
 
@@ -743,21 +768,23 @@ void LoadSettings()
     g_settings.showDesktopAtTop = Wh_GetIntSetting(L"Desktop.showDesktopAtTop");
     g_settings.desktopAboveThisPC = Wh_GetIntSetting(L"Desktop.desktopAboveThisPC");
     g_settings.desktopExpandable = Wh_GetIntSetting(L"Desktop.desktopExpandable");
-    g_settings.fixChevronDrawing = Wh_GetIntSetting(L"Chevrons.fixChevronDrawing");
-    g_settings.chevronScale = Wh_GetIntSetting(L"Chevrons.chevronScale");
+    g_settings.fixChevronDrawing = Wh_GetIntSetting(L"Resources.fixChevronDrawing");
+    g_settings.chevronScale = Wh_GetIntSetting(L"Resources.chevronScale");
+    g_settings.hidePinButtons = Wh_GetIntSetting(L"Resources.hidePinButtons");
 
     g_sepColor = CLR_INVALID;
 
     Wh_Log(L"Settings: thisPCAtTop=%d (expand=%d, startExp=%d) "
             L"desktopAtTop=%d (above=%d, expand=%d) "
-            L"sepRemoval=%d fixChevron=%d chevronScale=%d",
+            L"sepRemoval=%d fixChevron=%d chevronScale=%d hidePins=%d",
             g_settings.showThisPCAtTop,
             g_settings.thisPCExpandable, g_settings.thisPCStartExpanded,
             g_settings.showDesktopAtTop, g_settings.desktopAboveThisPC,
             g_settings.desktopExpandable,
             ShouldRemoveSeparators(),
             g_settings.fixChevronDrawing,
-            g_settings.chevronScale);
+            g_settings.chevronScale,
+            g_settings.hidePinButtons);
 }
 
 BOOL Wh_ModInit()
@@ -813,6 +840,16 @@ BOOL Wh_ModInit()
             },
             &SubClassTreeWndProc_orig,
             SubClassTreeWndProc_hook,
+            false
+        },
+        {
+            {
+                L"public: virtual long __cdecl"
+                L" CNscTree::SetStateImageList("
+                L"struct _IMAGELIST *)"
+            },
+            &SetStateImageList_orig,
+            SetStateImageList_hook,
             false
         }
     };
