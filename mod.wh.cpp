@@ -27,16 +27,18 @@ namespace object. This includes Recycle Bin, Control Panel, etc.
 instead of just the items on the desktop. (This target can't be
 pinned without this mod.)
 
-- **Fix chevron drawing:** Replaces the pixelated and clipped
-chevron with a smooth anti-aliased versions. The size can be
-tweaked to any percentage or pixel dimensions.
+Both virtual folders have a toggle for whether they are expandable
+or not. Their position can be swapped. Duplicate entries of Desktop
+or This PC can be removed from other parts of the nav. Also:
 
 - **Hide Home/Gallery:** Optional, default-enabled toggles to
 hide the native Explorer entries. They don't affect Quick Access.
 
-Both virtual folders have a toggle for whether they are expandable
-or not. Their position can be swapped. Duplicate entries of Desktop
-or This PC can be removed from other parts of the nav.
+- **Remove separators:** Optionally remove each separator individually.
+
+- **Fix chevron drawing:** Replaces the pixelated and clipped
+chevron with a smooth anti-aliased versions. The size (which
+matches other UI elements by default) is configurable.
 
 This mod injects only in processes that have ExplorerFrame.dll,
 so the include is set to `*` but it will not touch most processes.
@@ -45,16 +47,14 @@ Open/Save dialogs changed (only modern dialogs are affected.)
 
 Before:
 
-![Before](https://i.imgur.com/aahBZPG.png)
+![Before](https://i.imgur.com/nC9T5A7.jpeg)
 
 After:
 
-![After](https://i.imgur.com/e2fEDwb.png)
+![After](https://i.imgur.com/JQQ5ZTN.jpeg)
 
-The screenshots show the mod with the normal Desktop pinned to
-Quick Access in before, compared to adding it using the mod.
-
-Home and Gallery are already hidden using [standard](https://www.elevenforum.com/t/add-show-home-on-navigation-pane-to-folder-options-in-windows-11.27300/) [methods](https://www.elevenforum.com/t/add-show-gallery-on-navigation-pane-to-folder-options-in-windows-11.27301/).
+The screenshots show the normal Desktop pinned to Quick Access in
+the before, and the mod with defaults set in the after.
 */
 // ==/WindhawkModReadme==
 
@@ -93,6 +93,12 @@ Home and Gallery are already hidden using [standard](https://www.elevenforum.com
   - hideGallery: true
     $name: Hide Gallery
   $name: Hide Home/Gallery (does not affect Quick Access)
+- Separators:
+  - removeSepBelowNav: false
+    $name: Remove separator below top nav
+  - removeSepBelowQA: false
+    $name: Remove separator below Quick Access
+  $name: Separators
 - Resources:
   - fixChevronDrawing: true
     $name: Fix chevron drawing
@@ -107,11 +113,6 @@ Home and Gallery are already hidden using [standard](https://www.elevenforum.com
   - hidePinButtons: true
     $name: Hide "pin" icons
     $description: Hide gray pin icons to the right of Quick Access items.
-  - hideSeparators: false
-    $name: Hide separators
-    $description: >-
-      Hides the separator lines below the top nav items and
-      collapses the extra space they occupy.
   $name: Resources
 */
 // ==/WindhawkModSettings==
@@ -145,7 +146,8 @@ struct {
     bool fixChevronDrawing;
     int chevronScale;
     bool hidePinButtons;
-    bool hideSeparators;
+    bool removeSepBelowNav;
+    bool removeSepBelowQA;
 } g_settings;
 
 static PIDLIST_ABSOLUTE g_pidlThisPC = nullptr;
@@ -164,6 +166,7 @@ static bool g_removedHome = false;
 static bool g_removedGallery = false;
 static bool g_homeGalleryCleanupDone = false;
 static HTREEITEM g_boundaryItem = nullptr;
+static HTREEITEM g_belowQAItem = nullptr;
 static bool g_treeInteractionSubclassed = false;
 
 // 0=not ours, 1=This PC, 2=Desktop — set during AppendOneItem
@@ -180,7 +183,7 @@ static void RefreshNavPane();
 static void HotEnableInsert(HWND hWnd);
 static bool g_needHotInsert = false;
 
-static bool ShouldRemoveSeparators()
+static bool ShouldRemoveInternalSep()
 {
     return g_settings.showThisPCAtTop && g_settings.showDesktopAtTop;
 }
@@ -529,6 +532,7 @@ static void RedrawOtherSeparators(HWND hTree, HDC hdc)
 
     bool passedOurSection = false;
     bool foundBoundary = false;
+    bool foundBelowQA = false;
 
     h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM,
                                 TVGN_FIRSTVISIBLE, 0);
@@ -567,8 +571,13 @@ static void RedrawOtherSeparators(HWND hTree, HDC hdc)
                     }
                     else if (isTall)
                     {
-                        drawSep = true;
-                        sepY = rc.top + baseHeight / 2;
+                        if (g_settings.removeSepBelowQA && !foundBelowQA)
+                            foundBelowQA = true;
+                        else
+                        {
+                            drawSep = true;
+                            sepY = rc.top + baseHeight / 2;
+                        }
                     }
 
                     if (drawSep)
@@ -647,19 +656,18 @@ static LRESULT CALLBACK SepParentSubclassProc(
             {
                 LPNMTVCUSTOMDRAW cd = (LPNMTVCUSTOMDRAW)lParam;
                 DWORD stage = cd->nmcd.dwDrawStage;
-                bool removeSep = ShouldRemoveSeparators();
+                bool removeInternalSep = ShouldRemoveInternalSep();
                 bool hasDupHide = (g_hiddenDuplicate != nullptr);
-                bool hideAllSep = g_settings.hideSeparators &&
-                    (g_settings.showThisPCAtTop || g_settings.showDesktopAtTop);
+                bool removeAnySep =
+                    (g_settings.removeSepBelowNav ||
+                     g_settings.removeSepBelowQA) &&
+                    (g_settings.showThisPCAtTop ||
+                     g_settings.showDesktopAtTop);
 
                 if (stage == CDDS_PREPAINT &&
-                    (removeSep || hasDupHide || hideAllSep))
+                    (removeInternalSep || hasDupHide || removeAnySep))
                 {
-                    if (hideAllSep)
-                    {
-                        return CDRF_NOTIFYPOSTPAINT;
-                    }
-                    if (removeSep)
+                    if (removeInternalSep || removeAnySep)
                     {
                         if (g_sepColor == CLR_INVALID)
                         {
@@ -678,20 +686,19 @@ static LRESULT CALLBACK SepParentSubclassProc(
                 if (stage == CDDS_POSTPAINT)
                 {
                     if (g_sepColor == CLR_INVALID &&
-                        (removeSep || hasDupHide || hideAllSep))
+                        (removeInternalSep || hasDupHide || removeAnySep))
                     {
                         COLORREF c = SampleSeparatorColor(hTree, cd->nmcd.hdc);
                         if (c != CLR_INVALID)
                         {
                             g_sepColor = c;
                             Wh_Log(L"[SEP-COLOR] captured separator color: 0x%06X", c);
-                            if (removeSep || hideAllSep)
-                                InvalidateRect(hTree, NULL, TRUE);
+                            InvalidateRect(hTree, NULL, TRUE);
                         }
                     }
 
-                    if (removeSep && g_sepColor != CLR_INVALID &&
-                        !g_settings.hideSeparators)
+                    if ((removeInternalSep || removeAnySep) &&
+                        g_sepColor != CLR_INVALID)
                         RedrawOtherSeparators(hTree, cd->nmcd.hdc);
 
                     if (hasDupHide)
@@ -889,14 +896,14 @@ static bool CleanupQuickAccessDuplicates(HWND hTree)
         h = hNext;
     }
 
-    // When hideSeparators is off, keep the first duplicate as
+    // When removeSepBelowNav is off, keep the first duplicate as
     // g_hiddenDuplicate — painted over at CDDS_POSTPAINT with a separator
-    // line drawn through it. When hideSeparators is on, delete all
-    // duplicates so the space collapses entirely.
+    // line drawn through it. When on, delete all duplicates so the space
+    // collapses entirely.
     g_hiddenDuplicate = nullptr;
     for (int i = 0; i < delCount; i++)
     {
-        if (!g_settings.hideSeparators && !g_hiddenDuplicate)
+        if (!g_settings.removeSepBelowNav && !g_hiddenDuplicate)
         {
             g_hiddenDuplicate = toDelete[i];
 
@@ -1200,11 +1207,14 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
                 tvi->iIntegral = 1;
             }
 
-            if (g_settings.hideSeparators && tvi->iIntegral >= 2)
+            if (g_belowQAItem && tvi->hItem == g_belowQAItem &&
+                tvi->iIntegral >= 2)
+            {
                 tvi->iIntegral = 1;
+            }
 
             // Collapse the boundary between Desktop and This PC.
-            if (ShouldRemoveSeparators() && tvi->iIntegral >= 2)
+            if (ShouldRemoveInternalSep() && tvi->iIntegral >= 2)
             {
                 HTREEITEM hA = (g_hCachedTree == hWnd) ? g_hCachedThisPC : nullptr;
                 HTREEITEM hB = (g_hCachedTree == hWnd) ? g_hCachedDesktop : nullptr;
@@ -1257,11 +1267,14 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
             g_homeGalleryCleanupDone = RemoveHomeGalleryItems(hWnd);
         }
 
-        // Collapse iIntegral on separator items. When hideSeparators
-        // is on, collapse ALL tall depth-1 items. Otherwise just the
-        // boundary (first non-ours after our section).
-        if ((ShouldRemoveSeparators() || g_settings.hideSeparators) &&
-            g_hCachedTree == hWnd)
+        // Collapse iIntegral on separator items:
+        // - boundary (first non-ours after our section): always
+        // - below-QA (first tall item after boundary): when removeSepBelowQA
+        // Deferred until g_sepColor is captured so tall items remain
+        // for the sampling pass on the first paint cycle.
+        if ((ShouldRemoveInternalSep() || g_settings.removeSepBelowNav ||
+             g_settings.removeSepBelowQA) &&
+            g_sepColor != CLR_INVALID && g_hCachedTree == hWnd)
         {
             HTREEITEM hRoot = (HTREEITEM)SendMessageW(
                 hWnd, TVM_GETNEXTITEM, TVGN_ROOT, 0);
@@ -1270,6 +1283,7 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
                 HTREEITEM hChild = (HTREEITEM)SendMessageW(
                     hWnd, TVM_GETNEXTITEM, TVGN_CHILD, (LPARAM)hRoot);
                 bool passedOurs = false;
+                bool foundBoundary = false;
                 while (hChild)
                 {
                     if (hChild == g_hCachedThisPC || hChild == g_hCachedDesktop)
@@ -1278,19 +1292,35 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
                     }
                     else if (passedOurs && hChild != g_hiddenDuplicate)
                     {
-                        TVITEMEXW tvi = {};
-                        tvi.mask = TVIF_HANDLE | TVIF_INTEGRAL;
-                        tvi.hItem = hChild;
-                        SendMessageW(hWnd, TVM_GETITEMW, 0, (LPARAM)&tvi);
-                        if (tvi.iIntegral >= 2)
+                        if (!foundBoundary)
                         {
-                            tvi.iIntegral = 1;
-                            SendMessageW(hWnd, TVM_SETITEMW, 0, (LPARAM)&tvi);
-                        }
-                        if (!g_settings.hideSeparators)
-                        {
+                            TVITEMEXW tvi = {};
+                            tvi.mask = TVIF_HANDLE | TVIF_INTEGRAL;
+                            tvi.hItem = hChild;
+                            SendMessageW(hWnd, TVM_GETITEMW, 0, (LPARAM)&tvi);
+                            if (tvi.iIntegral >= 2)
+                            {
+                                tvi.iIntegral = 1;
+                                SendMessageW(hWnd, TVM_SETITEMW, 0, (LPARAM)&tvi);
+                            }
                             g_boundaryItem = hChild;
-                            break;
+                            foundBoundary = true;
+                            if (!g_settings.removeSepBelowQA)
+                                break;
+                        }
+                        else
+                        {
+                            TVITEMEXW tvi = {};
+                            tvi.mask = TVIF_HANDLE | TVIF_INTEGRAL;
+                            tvi.hItem = hChild;
+                            SendMessageW(hWnd, TVM_GETITEMW, 0, (LPARAM)&tvi);
+                            if (tvi.iIntegral >= 2)
+                            {
+                                tvi.iIntegral = 1;
+                                SendMessageW(hWnd, TVM_SETITEMW, 0, (LPARAM)&tvi);
+                                g_belowQAItem = hChild;
+                                break;
+                            }
                         }
                     }
                     hChild = (HTREEITEM)SendMessageW(
@@ -1310,8 +1340,8 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(
             }
         }
 
-        if (ShouldRemoveSeparators() || g_hiddenDuplicate ||
-            (g_settings.hideSeparators &&
+        if (ShouldRemoveInternalSep() || g_hiddenDuplicate ||
+            ((g_settings.removeSepBelowNav || g_settings.removeSepBelowQA) &&
              (g_settings.showThisPCAtTop || g_settings.showDesktopAtTop)))
             EnsureParentSubclass(hWnd);
 
@@ -1381,14 +1411,14 @@ void LoadSettings()
     g_settings.fixChevronDrawing = Wh_GetIntSetting(L"Resources.fixChevronDrawing");
     g_settings.chevronScale = Wh_GetIntSetting(L"Resources.chevronScale");
     g_settings.hidePinButtons = Wh_GetIntSetting(L"Resources.hidePinButtons");
-    g_settings.hideSeparators = Wh_GetIntSetting(L"Resources.hideSeparators");
-
-    g_sepColor = CLR_INVALID;
+    g_settings.removeSepBelowNav = Wh_GetIntSetting(L"Resources.removeSepBelowNav");
+    g_settings.removeSepBelowQA = Wh_GetIntSetting(L"Resources.removeSepBelowQA");
 
     Wh_Log(L"Settings: thisPCAtTop=%d (expand=%d, startExp=%d, hideQA=%d) "
             L"desktopAtTop=%d (above=%d, expand=%d, hideQA=%d) "
             L"hideHome=%d hideGallery=%d "
-            L"fixChevron=%d chevronScale=%d hidePins=%d hideSep=%d",
+            L"fixChevron=%d chevronScale=%d hidePins=%d "
+            L"rmSepNav=%d rmSepQA=%d",
             g_settings.showThisPCAtTop,
             g_settings.thisPCExpandable, g_settings.thisPCStartExpanded,
             g_settings.hideThisPCFromQuickAccess,
@@ -1399,7 +1429,8 @@ void LoadSettings()
             g_settings.fixChevronDrawing,
             g_settings.chevronScale,
             g_settings.hidePinButtons,
-            g_settings.hideSeparators);
+            g_settings.removeSepBelowNav,
+            g_settings.removeSepBelowQA);
 }
 
 BOOL Wh_ModInit()
@@ -1680,6 +1711,7 @@ static void RefreshNavPane()
     HTREEITEM prevHidden = g_hiddenDuplicate;
     g_hiddenDuplicate = nullptr;
     g_boundaryItem = nullptr;
+    g_belowQAItem = nullptr;
     g_homeGalleryCleanupDone = false;
     if (prevHidden)
     {
@@ -1691,7 +1723,6 @@ static void RefreshNavPane()
     }
 
     g_qaCleanupDone = false;
-    g_sepColor = CLR_INVALID;
 
     g_inCustomAppend = true;
 
@@ -1760,6 +1791,7 @@ static void HotEnableInsert(HWND hWnd)
     g_homeGalleryCleanupDone = false;
     g_hiddenDuplicate = nullptr;
     g_boundaryItem = nullptr;
+    g_belowQAItem = nullptr;
     g_sepColor = CLR_INVALID;
 
     // Insert our items on the UI thread. Since we're on the same
@@ -1813,15 +1845,19 @@ void Wh_ModSettingsChanged()
 {
     bool prevHideHome = g_settings.hideHome;
     bool prevHideGallery = g_settings.hideGallery;
-    bool prevHideSep = g_settings.hideSeparators;
+    bool prevRemoveSepNav = g_settings.removeSepBelowNav;
+    bool prevRemoveSepQA = g_settings.removeSepBelowQA;
 
     LoadSettings();
 
-    // If Home/Gallery toggled from hidden→visible, a full tree rebuild
-    // is needed since they're children of the hidden root and can only
-    // reappear by re-adding the hidden root.
+    // Full tree rebuild needed when:
+    // - Home/Gallery toggled hidden→visible (children of hidden root)
+    // - removeSepBelowNav toggled on→off (deleted QA dup must reappear)
+    // - removeSepBelowQA toggled on→off (collapsed iIntegral must restore)
     bool needRebuild = (prevHideHome && !g_settings.hideHome) ||
-                       (prevHideGallery && !g_settings.hideGallery);
+                       (prevHideGallery && !g_settings.hideGallery) ||
+                       (prevRemoveSepNav && !g_settings.removeSepBelowNav) ||
+                       (prevRemoveSepQA && !g_settings.removeSepBelowQA);
 
     if (needRebuild && g_pNscTree && g_pidlDesktop &&
         g_hCachedTree && IsWindow(g_hCachedTree))
@@ -1846,11 +1882,12 @@ void Wh_ModSettingsChanged()
             g_homeGalleryCleanupDone = false;
             g_hiddenDuplicate = nullptr;
             g_boundaryItem = nullptr;
+            g_belowQAItem = nullptr;
             g_sepColor = CLR_INVALID;
 
             g_needHotInsert = true;
             InvalidateRect(g_hCachedTree, nullptr, TRUE);
-            Wh_Log(L"[SETTINGS] Full rebuild for Home/Gallery visibility change");
+            Wh_Log(L"[SETTINGS] Full rebuild for settings change");
         }
     }
     else
@@ -1861,16 +1898,18 @@ void Wh_ModSettingsChanged()
             prevHideGallery != g_settings.hideGallery)
             g_homeGalleryCleanupDone = false;
 
-        if (prevHideSep != g_settings.hideSeparators)
+        if (prevRemoveSepNav != g_settings.removeSepBelowNav ||
+            prevRemoveSepQA != g_settings.removeSepBelowQA)
         {
             g_qaCleanupDone = false;
             g_hiddenDuplicate = nullptr;
             g_boundaryItem = nullptr;
-            g_sepColor = CLR_INVALID;
+            g_belowQAItem = nullptr;
         }
         else
         {
             g_boundaryItem = nullptr;
+            g_belowQAItem = nullptr;
         }
 
         if (g_hCachedTree && IsWindow(g_hCachedTree))
@@ -1936,6 +1975,7 @@ void Wh_ModUninit()
     g_hCachedHome = nullptr;
     g_hCachedGallery = nullptr;
     g_boundaryItem = nullptr;
+    g_belowQAItem = nullptr;
     g_homeGalleryCleanupDone = false;
 
     // Remove tree interaction subclass
