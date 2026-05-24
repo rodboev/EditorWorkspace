@@ -406,7 +406,6 @@ static COLORREF SampleSeparatorColor(HWND hTree, HDC hdc)
 static int g_lastSepPositions[8] = {};
 static int g_lastSepCount = 0;
 static bool g_qaCleanupDone = false;
-static HTREEITEM g_hQABoundaryItem = nullptr;
 static HTREEITEM g_hiddenDuplicate = nullptr;
 
 static void RedrawOtherSeparators(HWND hTree, HDC hdc)
