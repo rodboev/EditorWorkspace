@@ -598,6 +598,7 @@ static void DrawChevron(HDC hdc, const RECT *r, int partId, int stateId)
 }
 
 static thread_local bool g_inTreePaint = false;
+static thread_local int g_inSubclassProc = 0;
 
 // --- Separator removal ---
 // Strategy: swallowing NM_CUSTOMDRAW CDDS_PREPAINT (by returning
@@ -1219,7 +1220,8 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
         LPNMHDR hdr = (LPNMHDR)lParam;
         if (hdr && hdr->hwndFrom == hTree)
         {
-            if (hdr->code == (UINT)NM_CUSTOMDRAW && !g_deferredOpInProgress)
+            if (hdr->code == (UINT)NM_CUSTOMDRAW && !g_deferredOpInProgress &&
+                g_inSubclassProc == 0)
             {
                 LPNMTVCUSTOMDRAW cd = (LPNMTVCUSTOMDRAW)lParam;
                 DWORD stage = cd->nmcd.dwDrawStage;
@@ -1522,6 +1524,19 @@ SubClassTreeWndProc_t SubClassTreeWndProc_orig;
 
 LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
+    // Re-entrancy guard: if we're already on the stack (g_inSubclassProc > 0)
+    // from WM_PAINT or WM_DEFERRED_REBUILD, any SendMessageW from our code
+    // can deadlock via global CallWndProc hooks (translucent-windows,
+    // AquaSnap) that make cross-process kernel transitions. Pass through
+    // for re-entered messages. Safe exceptions: TVM_INSERTITEM (caches
+    // handles, sends nothing out), WM_NCDESTROY (cleanup, no sends).
+    if (g_inSubclassProc > 0 &&
+        uMsg != TVM_INSERTITEMW && uMsg != TVM_INSERTITEMA &&
+        uMsg != WM_NCDESTROY)
+    {
+        return SubClassTreeWndProc_orig(hWnd, uMsg, wParam, lParam, uIdSubclass, dwRefData);
+    }
+
     if (uMsg == TVM_INSERTITEMW || uMsg == TVM_INSERTITEMA)
     {
         bool isOurInsert = (g_insertingItem >= 0 && g_insertingItem < NAV_COUNT) &&
@@ -1759,6 +1774,8 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
             return 0;
         }
 
+        g_inSubclassProc++;
+
         TreeState* ts = GetTree(hWnd);
         ts = RunDeferredWork(hWnd, ts, WORK_FULL_REBUILD, FullRebuildTree);
         ts = RunDeferredWork(hWnd, ts, WORK_HOT_INSERT, HotEnableInsert);
@@ -1784,29 +1801,6 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
         }
 
         ts = GetTree(hWnd);
-        if (ts && (ts->pendingWork & WORK_EXPAND))
-        {
-            ts->pendingWork &= ~WORK_EXPAND;
-            ExpandStartExpandedItems(hWnd);
-        }
-        return 0;
-    }
-
-    if (uMsg == WM_PAINT)
-    {
-        TreeState* ts = GetTree(hWnd);
-
-        // Full rebuild and hot-insert deferred from settings change or
-        // missed message. Guarded to prevent re-entrancy (AppendRoot_orig
-        // pumps messages). checkGuard=true so another tree's in-progress
-        // op blocks us.
-        ts = RunDeferredWork(hWnd, ts, WORK_FULL_REBUILD, FullRebuildTree, true);
-        ts = RunDeferredWork(hWnd, ts, WORK_HOT_INSERT, HotEnableInsert, true);
-
-        // TVM_DELETEITEM during paint crashes (TV_SelectItem re-entrancy)
-        if (ts && (ts->pendingWork & (WORK_QA_CLEANUP | WORK_HG_CLEANUP)))
-            PostMessage(hWnd, WM_DEFERRED_REBUILD, 0, 0);
-
         if (ts && (ts->pendingWork & WORK_DUP_COLLAPSE))
         {
             WCHAR collapseText[NAV_COUNT][64] = {};
@@ -1819,6 +1813,28 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
             if (collapseCount > 0)
                 CollapseMatchingItems(hWnd, ts, collapseText, collapseCount);
         }
+
+        ts = GetTree(hWnd);
+        if (ts && (ts->pendingWork & WORK_EXPAND))
+        {
+            ts->pendingWork &= ~WORK_EXPAND;
+            ExpandStartExpandedItems(hWnd);
+        }
+
+        g_inSubclassProc--;
+        return 0;
+    }
+
+    if (uMsg == WM_PAINT)
+    {
+        TreeState* ts = GetTree(hWnd);
+
+        // Tree-mutating deferred work (rebuild, insert, delete, collapse)
+        // must NOT run during WM_PAINT. Defer to WM_DEFERRED_REBUILD.
+        constexpr uint8_t DEFER_MASK = WORK_FULL_REBUILD | WORK_HOT_INSERT |
+            WORK_QA_CLEANUP | WORK_HG_CLEANUP | WORK_DUP_COLLAPSE;
+        if (ts && (ts->pendingWork & DEFER_MASK))
+            PostMessage(hWnd, WM_DEFERRED_REBUILD, 0, 0);
 
         // Collapse iIntegral on visible inherited items so there's no
         // separator space between our items and them.
@@ -1904,14 +1920,25 @@ using DrawThemeBackground_t = HRESULT (WINAPI *)(HTHEME, HDC, int, int, LPCRECT,
 
 DrawThemeBackground_t DrawThemeBackground_orig;
 
+static thread_local bool g_chevronLogged = false;
+
 HRESULT WINAPI DrawThemeBackground_hook(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, LPCRECT pRect, LPCRECT pClipRect)
 {
-    if (g_inTreePaint && (iPartId == TVP_GLYPH || iPartId == TVP_HOTGLYPH))
+    if (iPartId == TVP_GLYPH || iPartId == TVP_HOTGLYPH)
     {
-        RECT drawRect;
-        CalcGlyphRect(pRect, &drawRect);
-        DrawChevron(hdc, &drawRect, iPartId, iStateId);
-        return S_OK;
+        if (!g_chevronLogged)
+        {
+            g_chevronLogged = true;
+            Wh_Log(L"[CHEVRON] DTB hook active, inPaint=%d fixEnabled=%d",
+                (int)g_inTreePaint, (int)g_settings.fixChevronDrawing);
+        }
+        if (g_inTreePaint)
+        {
+            RECT drawRect;
+            CalcGlyphRect(pRect, &drawRect);
+            DrawChevron(hdc, &drawRect, iPartId, iStateId);
+            return S_OK;
+        }
     }
     return DrawThemeBackground_orig(hTheme, hdc, iPartId, iStateId, pRect, pClipRect);
 }
@@ -2080,8 +2107,15 @@ BOOL Wh_ModInit()
     {
         FARPROC pDTB = GetProcAddress(hUxTheme, "DrawThemeBackground");
         if (pDTB)
+        {
             Wh_SetFunctionHook((void *)pDTB, (void *)DrawThemeBackground_hook, (void **)&DrawThemeBackground_orig);
+            Wh_Log(L"[CHEVRON] DTB hook installed at %p, orig=%p", pDTB, DrawThemeBackground_orig);
+        }
+        else
+            Wh_Log(L"[CHEVRON] GetProcAddress(DrawThemeBackground) failed");
     }
+    else
+        Wh_Log(L"[CHEVRON] uxtheme.dll not loaded");
 
     Wh_Log(L"Mod initialized successfully");
     return TRUE;
