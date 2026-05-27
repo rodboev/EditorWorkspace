@@ -2,7 +2,7 @@
 // @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's nav
-// @version         1.1.3
+// @version         1.1.4
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         *
@@ -216,6 +216,7 @@ enum PendingWork : uint8_t {
     WORK_QA_CLEANUP   = 0x04,
     WORK_HG_CLEANUP   = 0x08,
     WORK_DUP_COLLAPSE = 0x10,
+    WORK_EXPAND       = 0x20,
 };
 
 // Per-tree state: one entry per SysTreeView32 that we've injected items into.
@@ -413,7 +414,7 @@ static void BuildItemOrder(NavItem items[2])
         out.expandable = g_settings.items[id].expandable;
         out.enabled = g_settings.items[id].showAtTop;
         out.id = id;
-        out.style = g_settings.items[id].startExpanded ? 0x2 : 0UL;
+        out.style = 0;
     };
 
     fill(items[0], first);
@@ -444,6 +445,27 @@ static void InsertItems(void *pNsc, const NavItem items[2], unsigned long enumFl
             g_insertingItem = -1;
         }
     }
+}
+
+static void ExpandStartExpandedItems(HWND hTree)
+{
+    TreeState* ts = GetTree(hTree);
+    if (!ts || !ts->pNscTree) return;
+    g_deferredOpInProgress = true;
+    INameSpaceTreeControl *pNsc = (INameSpaceTreeControl *)ts->pNscTree;
+    for (int i = 0; i < NAV_COUNT; i++)
+    {
+        if (!IsInsertableItem(i) || !g_settings.items[i].showAtTop ||
+            !g_settings.items[i].startExpanded || !g_navItems[i].pidl)
+            continue;
+        IShellItem *psi = nullptr;
+        if (SUCCEEDED(SHCreateItemFromIDList(g_navItems[i].pidl, IID_IShellItem, (void **)&psi)) && psi)
+        {
+            pNsc->SetItemState(psi, NSTCIS_EXPANDED, NSTCIS_EXPANDED);
+            psi->Release();
+        }
+    }
+    DrainPendingRebuilds();
 }
 
 HRESULT THISCALL AppendRoot_hook(void *pThis, IShellItem *psiRoot, unsigned long grfEnumFlags, unsigned long grfRootStyle, IShellItemFilter *pFilter)
@@ -1528,7 +1550,7 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
                 if (IsInsertableItem(id))
                 {
                     ts.hiddenDuplicate = nullptr;
-                    ts.pendingWork |= WORK_QA_CLEANUP;
+                    ts.pendingWork |= WORK_QA_CLEANUP | WORK_EXPAND;
                     if (!ts.pNscTree)
                     {
                         ts.pNscTree = g_pNscTree;
@@ -1759,6 +1781,13 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
         {
             if (RemoveHiddenInheritedItems(hWnd, *ts))
                 ts->pendingWork &= ~WORK_HG_CLEANUP;
+        }
+
+        ts = GetTree(hWnd);
+        if (ts && (ts->pendingWork & WORK_EXPAND))
+        {
+            ts->pendingWork &= ~WORK_EXPAND;
+            ExpandStartExpandedItems(hWnd);
         }
         return 0;
     }
