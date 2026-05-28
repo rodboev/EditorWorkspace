@@ -1454,7 +1454,8 @@ static bool CleanupQuickAccessDuplicates(HWND hTree, TreeState& ts)
         InvalidateRect(hTree, nullptr, TRUE);
     }
 
-    bool complete = (childlessCount >= expectedCount);
+    int totalFound = childlessCount + sectionCount;
+    bool complete = (totalFound >= expectedCount);
     if (needDelete && (complete || ts.hiddenDuplicate != prevDup))
         Wh_Log(L"[QA-HIDE] tree=%p childless=%d sections=%d expected=%d", hTree, childlessCount, sectionCount, expectedCount);
 
