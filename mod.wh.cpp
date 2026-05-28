@@ -332,12 +332,9 @@ static void DrainPendingRebuilds()
 }
 
 static TreeState* RunDeferredWork(HWND hWnd, TreeState* ts,
-                                  uint8_t flag, void(*op)(HWND),
-                                  bool checkGuard = false)
+                                  uint8_t flag, void(*op)(HWND))
 {
     if (!ts || !(ts->pendingWork & flag))
-        return ts;
-    if (checkGuard && g_deferredOpInProgress)
         return ts;
     g_deferredOpInProgress = true;
     ts->pendingWork &= ~flag;
@@ -470,11 +467,7 @@ static void ExpandStartExpandedItems(HWND hTree)
 
 HRESULT THISCALL AppendRoot_hook(void *pThis, IShellItem *psiRoot, unsigned long grfEnumFlags, unsigned long grfRootStyle, IShellItemFilter *pFilter)
 {
-    // Intercept Home/Gallery root items by PIDL comparison.
-    // Must happen BEFORE g_inCustomAppend check: during FullRebuildTree,
-    // AppendRoot_orig for the hidden root can trigger Explorer to add
-    // Home/Gallery internally while g_inCustomAppend is true. Without
-    // this, ts.hItems[NAV_HOME]/ts.hItems[NAV_GALLERY] would never be cached.
+    // Must run before g_inCustomAppend check so Home/Gallery get cached.
     {
         PIDLIST_ABSOLUTE pidlRoot = nullptr;
         if (SUCCEEDED(SHGetIDListFromObject(psiRoot, &pidlRoot)))
@@ -733,8 +726,6 @@ static void RefreshNavPane(HWND hTree)
         }
     }
 
-    // Clear managed items — CleanupQuickAccessDuplicates will
-    // re-evaluate on the next paint.
     ResetTreeCleanup(*ts);
 
     {
@@ -764,8 +755,7 @@ static void HotEnableInsert(HWND hWnd)
 
     ts->hItems[NAV_THISPC] = nullptr;
     ts->hItems[NAV_DESKTOP] = nullptr;
-    // Don't clear inherited items (Home/Gallery): they may have been
-    // cached during FullRebuildTree's AppendRoot_orig and are still valid.
+    // Home/Gallery handles may still be valid from FullRebuildTree.
     ResetTreeCleanup(*ts);
     ResetSepColor();
 
@@ -781,9 +771,7 @@ static void HotEnableInsert(HWND hWnd)
            ts ? ts->hItems[NAV_THISPC] : nullptr, ts ? ts->hItems[NAV_DESKTOP] : nullptr,
            ts ? ts->hItems[NAV_HOME] : nullptr, ts ? ts->hItems[NAV_GALLERY] : nullptr);
 
-    // Invalidate for dedup and separator setup on the next paint
-    // (not RDW_UPDATENOW since we're already inside WM_PAINT)
-    InvalidateRect(hWnd, nullptr, TRUE);
+    InvalidateRect(hWnd, nullptr, TRUE); // not RDW_UPDATENOW: inside WM_PAINT
 }
 
 static LRESULT CALLBACK TreeInteractionProc(
@@ -830,14 +818,12 @@ static void RestoreTree(HWND hTree)
     if (!roots.Create()) return;
     roots.RemoveInsertableRoots(pNsc.get());
 
-    // Re-add hidden root with current (zeroed) settings — hook passes through
     if (roots.items[NAV_DESKTOP] && pNscRaw)
     {
         g_inCustomAppend = true;
         AppendRoot_orig(pNscRaw, roots.items[NAV_DESKTOP].get(), enumFlags, 0x1, pFilter.get());
         g_inCustomAppend = false;
 
-        // Collapse expanded items matching our items' names
         WCHAR collapseNames[NAV_COUNT][64] = {};
         int collapseCount = BuildMatchList(collapseNames, NAV_COUNT,
             [](int id, const NavItemSettings&) {
@@ -856,7 +842,6 @@ static void RestoreTree(HWND hTree)
         Wh_Log(L"[DISABLE] Restored state image list %p for tree=%p", savedImgList, hTree);
     }
 
-    // Re-fetch ts: AppendRoot_orig pumps messages
     ts = GetTree(hTree);
     if (ts)
     {
@@ -870,12 +855,10 @@ static void RestoreTree(HWND hTree)
         }
     }
 
-    // Release TreeState's ownership ref (separate from our ComRef AddRef)
     if (ownsRef)
         pNsc.p->Release();
 
     Wh_Log(L"[DISABLE] Cleaned up tree=%p", hTree);
-    // ComRef destructors release our local AddRefs (pFilter, pNsc)
 }
 
 static void FullRebuildTree(HWND hTree)
@@ -899,9 +882,6 @@ static void FullRebuildTree(HWND hTree)
 
     if (roots.items[NAV_DESKTOP])
     {
-        // Clear ALL item handles: RemoveRoot(pDesktop) destroys the
-        // hidden root and all its children (Home, Gallery, QA items).
-        // All old handles are now invalid.
         ts = GetTree(hTree);
         if (ts)
         {
@@ -917,8 +897,6 @@ static void FullRebuildTree(HWND hTree)
         AppendRoot_orig(pNscRaw, roots.items[NAV_DESKTOP].get(), enumFlags, 0x1, nullptr);
         g_inCustomAppend = false;
 
-        // Re-fetch ts: AppendRoot_orig pumps messages, which can
-        // trigger TVM_INSERTITEM and rehash g_trees.
         ts = GetTree(hTree);
         if (ts)
         {
@@ -1236,11 +1214,6 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 
                 if (stage == CDDS_POSTPAINT)
                 {
-                    // Re-verify separator color after theme/syscolor
-                    // change. CDDS_PREPAINT let native separators
-                    // through so we can re-sample. If the color
-                    // changed, update and repaint; if same, just
-                    // repaint to re-suppress native separators.
                     if (g_sepColorPendingVerify && g_sepColor != CLR_INVALID && g_settings.hasItemsAtTop)
                     {
                         g_sepColorPendingVerify = false;
@@ -1304,8 +1277,6 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 }
             }
 
-            // After expand/collapse, force full repaint so stale
-            // separator lines at old positions get overwritten.
             if (hdr->code == TVN_ITEMEXPANDEDW ||
                 hdr->code == TVN_ITEMEXPANDEDA)
             {
@@ -1357,13 +1328,7 @@ HRESULT THISCALL SetStateImageList_hook(void *pThis, HIMAGELIST himl)
     return SetStateImageList_orig(pThis, himl);
 }
 
-// --- Quick Access item hiding ---
-// Walk depth-1 children of the hidden root and delete items matching
-// our items' display text. Both childless QA pins and native sections
-// with children are deleted — our top-level items replace them.
-//
-// Returns true when all expected childless duplicates were found.
-// Returns false if some are still missing (async population race).
+// Returns false if expected dups are missing (async population race).
 static bool CleanupQuickAccessDuplicates(HWND hTree, TreeState& ts)
 {
     if (!ts.hItems[NAV_THISPC] && !ts.hItems[NAV_DESKTOP])
@@ -1422,7 +1387,6 @@ static bool CleanupQuickAccessDuplicates(HWND hTree, TreeState& ts)
     if (needDelete)
         SendMessageW(hTree, WM_SETREDRAW, FALSE, 0);
 
-    // Native sections with children: always delete (our items replace them)
     for (int i = 0; i < sectionCount; i++)
     {
         Wh_Log(L"[QA-HIDE] deleting native section=%p", toDeleteSections[i]);
@@ -1525,12 +1489,8 @@ SubClassTreeWndProc_t SubClassTreeWndProc_orig;
 
 LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
-    // Re-entrancy guard: if we're already on the stack (g_inSubclassProc > 0)
-    // from WM_PAINT or WM_DEFERRED_REBUILD, any SendMessageW from our code
-    // can deadlock via global CallWndProc hooks (translucent-windows,
-    // AquaSnap) that make cross-process kernel transitions. Pass through
-    // for re-entered messages. Safe exceptions: TVM_INSERTITEM (caches
-    // handles, sends nothing out), WM_NCDESTROY (cleanup, no sends).
+    // Pass through re-entered messages to avoid deadlocks via other
+    // mods' global CallWndProc hooks during our SendMessageW calls.
     if (g_inSubclassProc > 0 &&
         uMsg != TVM_INSERTITEMW && uMsg != TVM_INSERTITEMA &&
         uMsg != WM_NCDESTROY)
@@ -1830,15 +1790,11 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
     {
         TreeState* ts = GetTree(hWnd);
 
-        // Tree-mutating deferred work (rebuild, insert, delete, collapse)
-        // must NOT run during WM_PAINT. Defer to WM_DEFERRED_REBUILD.
         constexpr uint8_t DEFER_MASK = WORK_FULL_REBUILD | WORK_HOT_INSERT |
             WORK_QA_CLEANUP | WORK_HG_CLEANUP | WORK_DUP_COLLAPSE;
         if (ts && (ts->pendingWork & DEFER_MASK))
             PostMessage(hWnd, WM_DEFERRED_REBUILD, 0, 0);
 
-        // Collapse iIntegral on visible inherited items so there's no
-        // separator space between our items and them.
         if (ts && g_settings.hasItemsAtTop)
         {
             for (int i = NAV_HOME; i < NAV_COUNT; i++)
@@ -1849,9 +1805,7 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
             }
         }
 
-        // Find and optionally collapse separator boundary items.
-        // Deferred until g_sepColor is captured so tall items remain
-        // for the sampling pass on the first paint cycle.
+        // Tall items remain until g_sepColor is captured for sampling.
         if (g_settings.hasItemsAtTop && g_sepColor != CLR_INVALID && ts)
         {
             SectionLayout layout = FindSectionLayout(hWnd, *ts);
