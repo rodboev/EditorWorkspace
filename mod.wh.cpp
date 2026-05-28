@@ -2,7 +2,7 @@
 // @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's nav
-// @version         1.1.4
+// @version         1.1.5
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         *
@@ -33,11 +33,11 @@ This mod injects only in processes that have ExplorerFrame.dll, so the include i
 
 Before:
 
-![Before](https://i.imgur.com/nC9T5A7.jpeg)
+![Before](https://i.imgur.com/eWSQRJb.png)
 
 After:
 
-![After](https://i.imgur.com/JQQ5ZTN.jpeg)
+![After](https://i.imgur.com/6IaHifm.png)
 
 The screenshots show the normal Desktop pinned to Quick Access in the before, and the mod with defaults set in the after.
 */
@@ -331,8 +331,7 @@ static void DrainPendingRebuilds()
     }
 }
 
-static TreeState* RunDeferredWork(HWND hWnd, TreeState* ts,
-                                  uint8_t flag, void(*op)(HWND))
+static TreeState* RunDeferredWork(HWND hWnd, TreeState* ts, uint8_t flag, void(*op)(HWND))
 {
     if (!ts || !(ts->pendingWork & flag))
         return ts;
