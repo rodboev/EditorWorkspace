@@ -2,7 +2,7 @@
 // @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's nav
-// @version         1.1.8
+// @version         1.1.9
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         *
@@ -1588,7 +1588,7 @@ static bool RemoveHiddenInheritedItems(HWND hTree, TreeState& ts)
         SendMessageW(hTree, WM_SETREDRAW, TRUE, 0);
         InvalidateRect(hTree, nullptr, TRUE);
     }
-    return (delCount >= targetCount);
+    return true;
 }
 
 // --- SubClassTreeWndProc ---
@@ -1704,7 +1704,8 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
                     for (int i = NAV_THISPC; i <= NAV_DESKTOP; i++)
                         if (ts->hItems[i]) { hasOurItems = true; break; }
 
-                    if (hasOurItems && !g_deferredOpInProgress && !g_inTreePaint)
+                    if (hasOurItems && !g_deferredOpInProgress && !g_inTreePaint &&
+                        g_inSubclassProc == 0)
                     {
                         ts->pendingWork |= WORK_FULL_REBUILD;
                         PostMessage(hWnd, WM_DEFERRED_REBUILD, 0, 0);
