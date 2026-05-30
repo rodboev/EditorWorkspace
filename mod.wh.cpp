@@ -2,7 +2,7 @@
 // @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's nav
-// @version         1.1.10
+// @version         1.1.11
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         *
@@ -202,12 +202,22 @@ enum ChangeTier { TIER_NONE, TIER_REPAINT, TIER_REFRESH, TIER_REBUILD };
 static ULONG_PTR g_gdipToken = 0;
 static std::set<HWND> g_subclassedParents;
 static COLORREF g_sepColor = CLR_INVALID;
-static bool g_sepColorPendingVerify = false;
 static bool g_logSepDraw = true;
 
 static void ResetSepColor() {
     g_sepColor = CLR_INVALID;
     g_logSepDraw = true;
+}
+
+static COLORREF DeriveSepColor(HWND hTree)
+{
+    COLORREF bg = (COLORREF)SendMessageW(hTree, TVM_GETBKCOLOR, 0, 0);
+    if (bg == CLR_INVALID || (int)bg == -1)
+        bg = GetSysColor(COLOR_WINDOW);
+    int sum = GetRValue(bg) + GetGValue(bg) + GetBValue(bg);
+    int d = (sum < 384) ? 56 : -41;
+    auto cl = [](int v) { return (BYTE)(v < 0 ? 0 : (v > 255 ? 255 : v)); };
+    return RGB(cl(GetRValue(bg) + d), cl(GetGValue(bg) + d), cl(GetBValue(bg) + d));
 }
 
 enum PendingWork : uint8_t {
@@ -231,7 +241,6 @@ struct TreeState {
     HTREEITEM boundaryItem = nullptr;
     HTREEITEM belowQAItem = nullptr;
     uint8_t pendingWork = 0;   // bitmask of PendingWork flags
-    bool qaEverCleaned = false;
     bool ownsNscRef = false;
     bool triedHomeSpacer = false;
     HIMAGELIST savedStateImageList = nullptr;
@@ -303,7 +312,6 @@ static void ResetTreeCleanup(TreeState& ts)
     ts.belowQAItem = nullptr;
     ts.triedHomeSpacer = false;
     ts.pendingWork = WORK_QA_CLEANUP | WORK_HG_CLEANUP | WORK_DUP_COLLAPSE;
-    ts.qaEverCleaned = false;
 }
 
 // Globals bridging AppendRoot_hook to TVM_INSERTITEM handler.
@@ -316,7 +324,7 @@ struct InsertionCtx {
 };
 static InsertionCtx g_ins;
 
-// AppendRoot_orig pumps messages, so a second tree's deferred op could corrupt g_ins.
+// Guards are static (not thread_local) because Wh_ModInit runs on the loader thread but hooks fire on the UI thread.
 static bool g_deferredOpInProgress = false;
 static HWND g_mutatingTree = nullptr;
 static std::unordered_set<HWND> g_pendingRebuildTrees;
@@ -594,11 +602,10 @@ static void DrawChevron(HDC hdc, const RECT *r, int partId, int stateId)
 static thread_local bool g_inTreePaint = false;
 static thread_local int g_inSubclassProc = 0;
 
-// --- Separator removal ---
-// Strategy: swallowing NM_CUSTOMDRAW CDDS_PREPAINT (by returning
-// CDRF_NOTIFYPOSTPAINT without calling DefSubclassProc) hides ALL
-// separator lines. At CDDS_POSTPAINT we redraw the ones we want to
-// keep — all section boundaries EXCEPT the one between our custom items.
+static bool AreWeMutating()
+{
+    return g_deferredOpInProgress || g_inSubclassProc > 0 || g_inCustomAppend;
+}
 
 static bool IsDepth1Item(HWND hTree, HTREEITEM h)
 {
@@ -709,6 +716,8 @@ static bool ShouldBeUnitHeight(const TreeState& ts, HWND hTree, HTREEITEM h)
 
     return false;
 }
+
+// --- Separator removal: CDDS_PREPAINT swallows all native separators; CDDS_POSTPAINT redraws wanted ones. ---
 
 static int GetBaseItemHeight(HWND hTree)
 {
@@ -959,6 +968,24 @@ static void FullRebuildTree(HWND hTree)
     void *pNscRaw = ts->pNscTree;
     unsigned long enumFlags = ts->enumFlags;
 
+    // Remove HomeSpacer before roots — it's a separate namespace item.
+    if (ts->homeSpacerItem)
+    {
+        int spacerId = g_navItems[NAV_HOME].pidl ? NAV_HOME
+                     : (g_navItems[NAV_GALLERY].pidl ? NAV_GALLERY : -1);
+        if (spacerId >= 0)
+        {
+            IShellItem* raw = nullptr;
+            if (SUCCEEDED(SHCreateItemFromIDList(g_navItems[spacerId].pidl,
+                                                  IID_IShellItem, (void**)&raw)) && raw)
+            {
+                pNsc->RemoveRoot(raw);
+                raw->Release();
+            }
+        }
+        ts->homeSpacerItem = nullptr;
+    }
+
     RootShellItems roots;
     if (!roots.Create()) return;
     roots.RemoveInsertableRoots(pNsc.get());
@@ -1004,8 +1031,10 @@ static void InsertHomeSpacer(HWND hTree)
     TreeState* ts = GetTree(hTree);
     if (!ts) return;
     ts->triedHomeSpacer = true;
-    // WORK_HOME_SPACER may fire before This PC is cached; re-check desktopOnly.
-    if (!ts->pNscTree || !ts->hItems[NAV_DESKTOP] || ts->hItems[NAV_THISPC]) return;
+    // Re-check: Desktop must be bottom of our section (alone or below This PC).
+    bool desktopAtBottom = ts->hItems[NAV_DESKTOP] &&
+        (!ts->hItems[NAV_THISPC] || !g_settings.desktopAboveThisPC);
+    if (!ts->pNscTree || !desktopAtBottom) return;
 
     int spacerId = g_navItems[NAV_HOME].pidl ? NAV_HOME
                  : (g_navItems[NAV_GALLERY].pidl ? NAV_GALLERY : -1);
@@ -1066,8 +1095,7 @@ static SectionLayout FindSectionLayout(HWND hTree, TreeState& ts)
 {
     SectionLayout layout = {};
 
-    // Pre-resolve display names for inherited items with null handles
-    // so we can identify them by text during the walk.
+    // Text fallback for inherited items whose handles haven't been cached yet.
     WCHAR inheritedNames[NAV_COUNT][64] = {};
     bool inheritedHidden[NAV_COUNT] = {};
     for (int i = NAV_HOME; i < NAV_COUNT; i++)
@@ -1165,74 +1193,7 @@ static void DrawSeparatorLine(HDC hdc, HWND hTree, int sepY)
     }
 }
 
-// Sample the separator line color from the DC. Called on the first
-// paint cycle when CDDS_PREPAINT was NOT swallowed (separators visible).
-static COLORREF SampleSeparatorColor(HWND hTree, HDC hdc)
-{
-    if (!hdc || !IsWindow(hTree))
-        return CLR_INVALID;
-
-    RECT client;
-    GetClientRect(hTree, &client);
-    if (client.right <= 0)
-        return CLR_INVALID;
-
-    int baseHeight = GetBaseItemHeight(hTree);
-    if (baseHeight <= 0)
-        return CLR_INVALID;
-
-    int tallThreshold = baseHeight + baseHeight / 2;
-
-    // Find the first tall depth-1 item — its separator is at rc.top + baseHeight/2
-    HTREEITEM h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM, TVGN_FIRSTVISIBLE, 0);
-    while (h)
-    {
-        if (IsDepth1Item(hTree, h))
-        {
-            RECT rc = {};
-            if (GetItemRect(hTree, h, &rc))
-            {
-                int ih = rc.bottom - rc.top;
-                if (ih >= tallThreshold)
-                {
-                    int sepY = rc.top + baseHeight / 2;
-                    int sampleX = client.right / 2;
-
-                    // Sample background color nearby for validation
-                    COLORREF bg = GetPixel(hdc, sampleX, rc.top + baseHeight + baseHeight / 4);
-
-                    auto isPlausible = [&](COLORREF c) -> bool {
-                        if (c == CLR_INVALID || c == 0x000000)
-                            return false;
-                        if (bg == CLR_INVALID)
-                            return true;
-                        // Reject if separator color is too far from background
-                        int dr = abs((int)GetRValue(c) - (int)GetRValue(bg));
-                        int dg = abs((int)GetGValue(c) - (int)GetGValue(bg));
-                        int db = abs((int)GetBValue(c) - (int)GetBValue(bg));
-                        return (dr + dg + db) < 200;
-                    };
-
-                    COLORREF c = GetPixel(hdc, sampleX, sepY);
-                    if (isPlausible(c))
-                        return c;
-                    for (int dy = -2; dy <= 2; dy++)
-                    {
-                        c = GetPixel(hdc, sampleX, sepY + dy);
-                        if (isPlausible(c))
-                            return c;
-                    }
-                }
-            }
-        }
-        h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM, TVGN_NEXTVISIBLE, (LPARAM)h);
-    }
-
-    return CLR_INVALID;
-}
-
-// At CDDS_POSTPAINT, all separators have been hidden by CDDS_PREPAINT
-// swallowing. Redraw separators for section boundaries we want to keep.
+// Redraws wanted separators at CDDS_POSTPAINT after CDDS_PREPAINT hid all native ones.
 
 static bool HasOurItemsInTree(const TreeState& ts)
 {
@@ -1259,10 +1220,7 @@ static void RedrawOtherSeparators(HWND hTree, HDC hdc, TreeState& ts)
     bool foundBelowQA = false;
     int sepCount = 0;
 
-    // Diagnostic: build a walk summary for logging
-    // Each depth-1 item gets a tag: O=ours, H=home, G=gallery,
-    // B=boundary(tall), b=boundary(short), Q=belowQA(skipped),
-    // S=sep-drawn, .=other
+    // Walk log tags: O=ours, H=home, G=gallery, B/b=boundary, Q=belowQA, S=sep, .=other
     WCHAR walkLog[64] = {};
     int walkIdx = 0;
 
@@ -1340,10 +1298,7 @@ static void RedrawOtherSeparators(HWND hTree, HDC hdc, TreeState& ts)
     }
 }
 
-// Parent subclass — intercepts NM_CUSTOMDRAW.
-// Returning CDRF_NOTIFYPOSTPAINT at CDDS_PREPAINT without calling
-// DefSubclassProc hides ALL separator lines
-// At CDDS_POSTPAINT we redraw the separators we want to keep.
+// Parent subclass: CDDS_PREPAINT suppresses native separators, CDDS_POSTPAINT redraws wanted ones.
 static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, DWORD_PTR dwRefData)
 {
     HWND hTree = (HWND)dwRefData;
@@ -1360,7 +1315,8 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 TreeState* ts = GetTree(hTree);
                 if (stage == CDDS_PREPAINT && g_settings.hasItemsAtTop)
                 {
-                    if (g_sepColor != CLR_INVALID && !g_sepColorPendingVerify)
+                    // Only suppress native separators once our items are in this tree.
+                    if (ts && HasOurItemsInTree(*ts))
                         return CDRF_NOTIFYPOSTPAINT;
                     LRESULT r = DefSubclassProc(hWnd, uMsg, wParam, lParam);
                     return r | CDRF_NOTIFYPOSTPAINT;
@@ -1368,29 +1324,11 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 
                 if (stage == CDDS_POSTPAINT)
                 {
-                    if (g_sepColorPendingVerify && g_sepColor != CLR_INVALID && g_settings.hasItemsAtTop)
-                    {
-                        g_sepColorPendingVerify = false;
-                        COLORREF c = SampleSeparatorColor(hTree, cd->nmcd.hdc);
-                        if (c != CLR_INVALID && c != g_sepColor)
-                        {
-                            Wh_Log(L"[SEP] color changed 0x%06X -> 0x%06X tree=%p", g_sepColor, c, hTree);
-                            g_sepColor = c;
-                            g_logSepDraw = true;
-                        }
-                        InvalidateRect(hTree, NULL, TRUE);
-                    }
-
                     if (g_sepColor == CLR_INVALID && g_settings.hasItemsAtTop)
                     {
-                        COLORREF c = SampleSeparatorColor(hTree, cd->nmcd.hdc);
-                        if (c != CLR_INVALID)
-                        {
-                            g_sepColor = c;
-                            g_logSepDraw = true;
-                            Wh_Log(L"[SEP] color=0x%06X tree=%p", c, hTree);
-                            InvalidateRect(hTree, NULL, TRUE);
-                        }
+                        g_sepColor = DeriveSepColor(hTree);
+                        g_logSepDraw = true;
+                        Wh_Log(L"[SEP] color=0x%06X tree=%p (derived)", g_sepColor, hTree);
                     }
 
                     if (g_settings.hasItemsAtTop && g_sepColor != CLR_INVALID && ts)
@@ -1452,9 +1390,7 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     }
 
     if (uMsg == WM_THEMECHANGED || uMsg == WM_SYSCOLORCHANGE)
-    {
-        g_sepColorPendingVerify = true;
-    }
+        ResetSepColor();
 
     if (uMsg == WM_NCDESTROY)
         g_subclassedParents.erase(hWnd);
@@ -1626,8 +1562,7 @@ SubClassTreeWndProc_t SubClassTreeWndProc_orig;
 
 LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
-    // Pass through re-entered messages to avoid deadlocks via other
-    // mods' global CallWndProc hooks during our SendMessageW calls.
+    // Re-entered messages pass through to avoid deadlocks from other mods' global CallWndProc hooks.
     if (g_inSubclassProc > 0 &&
         uMsg != TVM_INSERTITEMW && uMsg != TVM_INSERTITEMA &&
         uMsg != WM_NCDESTROY)
@@ -1729,8 +1664,7 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
                     for (int i = NAV_THISPC; i <= NAV_DESKTOP; i++)
                         if (ts->hItems[i]) { hasOurItems = true; break; }
 
-                    if (hasOurItems && !g_deferredOpInProgress && !g_inTreePaint &&
-                        g_inSubclassProc == 0)
+                    if (hasOurItems && !AreWeMutating() && !g_inTreePaint)
                     {
                         ts->pendingWork |= WORK_FULL_REBUILD;
                         PostMessage(hWnd, WM_DEFERRED_REBUILD, 0, 0);
@@ -1849,7 +1783,6 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
             if (CleanupQuickAccessDuplicates(hWnd, *ts))
             {
                 ts->pendingWork &= ~WORK_QA_CLEANUP;
-                ts->qaEverCleaned = true;
             }
             ts = GetTree(hWnd);
         }
@@ -1900,6 +1833,7 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
         if (ts && (ts->pendingWork & DEFER_MASK))
             PostMessage(hWnd, WM_DEFERRED_REBUILD, 0, 0);
 
+        // Paint-time mutations must be idempotent (no-op when already in target state) to avoid relayout loops.
         if (ts && g_settings.hasItemsAtTop)
         {
             for (int i = NAV_HOME; i < NAV_COUNT; i++)
@@ -1908,17 +1842,29 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
                 if (!g_settings.items[i].hide)
                     CollapseItemIntegral(hWnd, ts->hItems[i]);
             }
+            // TVM_SETITEMW's rect check can fail before layout; catch it here.
+            if (ShouldRemoveInternalSep() && ts->hItems[NAV_THISPC] && ts->hItems[NAV_DESKTOP])
+            {
+                RECT rcA = {}, rcB = {};
+                if (GetItemRect(hWnd, ts->hItems[NAV_THISPC], &rcA) &&
+                    GetItemRect(hWnd, ts->hItems[NAV_DESKTOP], &rcB))
+                {
+                    HTREEITEM hLower = (rcA.top > rcB.top) ? ts->hItems[NAV_THISPC] : ts->hItems[NAV_DESKTOP];
+                    CollapseItemIntegral(hWnd, hLower);
+                }
+            }
         }
 
-        // Tall items remain until g_sepColor is captured for sampling.
         if (g_settings.hasItemsAtTop && g_sepColor != CLR_INVALID && ts)
         {
             SectionLayout layout = FindSectionLayout(hWnd, *ts);
             ts->boundaryItem = layout.boundary;
             ts->belowQAItem = nullptr;
 
-            bool desktopOnly = ts->hItems[NAV_DESKTOP] && !ts->hItems[NAV_THISPC];
-            if (!ts->triedHomeSpacer && layout.boundary && desktopOnly
+            // Desktop is the bottom item of our section when alone or below This PC.
+            bool desktopAtBottom = ts->hItems[NAV_DESKTOP] &&
+                (!ts->hItems[NAV_THISPC] || !g_settings.desktopAboveThisPC);
+            if (!ts->triedHomeSpacer && layout.boundary && desktopAtBottom
                 && !g_settings.removeSepBelowNav && !GetHiddenItem(*ts)
                 && !layout.homePresent && !layout.galleryPresent)
             {
@@ -2383,9 +2329,7 @@ void Wh_ModSettingsChanged()
     if (tier == TIER_NONE)
         return;
 
-    // Snapshot HWNDs: FullRebuildTree pumps messages, which can trigger
-    // TVM_INSERTITEM on other trees, calling g_trees[hWnd] (operator[])
-    // and invalidating iterators if we're mid-range-for.
+    // Snapshot HWNDs: FullRebuildTree pumps messages, which can rehash g_trees mid-iteration.
     std::vector<HWND> treeList;
     treeList.reserve(g_trees.size());
     for (auto& [hTree, ts] : g_trees)
@@ -2437,7 +2381,6 @@ void Wh_ModSettingsChanged()
             if (dedupChanged)
             {
                 ts->pendingWork |= WORK_QA_CLEANUP;
-                ts->qaEverCleaned = false;
             }
             if (sepChanged || dedupChanged)
             {
@@ -2456,8 +2399,7 @@ void Wh_ModUninit()
     g_settings = {};
     ResetSepColor();
 
-    // Snapshot HWNDs: AppendRoot_orig pumps messages, which could
-    // trigger TVM_INSERTITEM and modify g_trees during iteration.
+    // Snapshot HWNDs: AppendRoot_orig pumps messages, which can rehash g_trees mid-iteration.
     std::vector<HWND> uninitList;
     uninitList.reserve(g_trees.size());
     for (auto& [hTree, ts] : g_trees)
