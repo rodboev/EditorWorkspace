@@ -89,7 +89,8 @@ separator toggles, chevron/pin settings, and the precomputed
 
 ### Multi-window architecture
 
-Per-tree state is stored in `std::unordered_map<HWND, TreeState> g_trees`.
+Per-tree state is stored in `std::unordered_map<HWND, TreeState> g_trees`,
+guarded by `std::recursive_mutex g_treesMutex`.
 Each `TreeState` holds: `pNscTree`, `enumFlags`, `pFilter`, item handles
 (`hItems[NAV_COUNT]`), section state (`hiddenDuplicate`, `homeSpacerItem`,
 `boundaryItem`, `belowQAItem`), pending work (`pendingWork` — bitmask of
@@ -97,7 +98,8 @@ Each `TreeState` holds: `pNscTree`, `enumFlags`, `pFilter`, item handles
 `WORK_HG_CLEANUP`, `WORK_DUP_COLLAPSE`, `WORK_EXPAND`,
 `WORK_HOME_SPACER`), and lifecycle state (`ownsNscRef`,
 `triedHomeSpacer`, `savedStateImageList`).
-`GetTree(HWND)` returns a pointer or null.
+`GetTree(HWND)` acquires `g_treesMutex`, does a map lookup, and returns
+a pointer or null.
 `GetHiddenItem(ts)` returns `ts.hiddenDuplicate ? ts.hiddenDuplicate
 : ts.homeSpacerItem` — the single item (a kept QA dup OR an injected
 Home spacer) that, when present, occupies the below-nav boundary and
@@ -119,19 +121,24 @@ must be re-fetched via `GetTree()`.
 HWND so TVM_INSERTITEM messages from other trees during message pumping
 are ignored.
 
-**`g_mutatingTree`**: Set to the HWND of the tree currently being
-mutated (during the `WM_DEFERRED_REBUILD` dispatch, `FullRebuildTree`,
-and the `INS_DEFERRED_GUARD` insert path). `SepParentSubclassProc`
-ignores `NM_CUSTOMDRAW` when `hTree == g_mutatingTree`, preventing
-cross-tree paint side effects during multi-window rebuilds. Cleared by
+**`g_mutatingTree`** (`std::atomic<HWND>`): Set to the HWND of the tree
+currently being mutated (during the `WM_DEFERRED_REBUILD` dispatch,
+`FullRebuildTree`, the `INS_DEFERRED_GUARD` insert path, and
+`Wh_ModUninit` around `RestoreTree`). `SepParentSubclassProc` ignores
+`NM_CUSTOMDRAW` when `hTree == g_mutatingTree` (preventing cross-tree
+paint side effects) and suppresses `TVN_SELCHANGEDW`/`TVN_SELCHANGEDA`
+when `hTree == g_mutatingTree` (preventing Explorer from navigating
+during tree mutations). Atomic because it is set by the engine thread
+in `Wh_ModUninit` and read by UI threads. Cleared by
 `DrainPendingRebuilds`.
 
-**`g_deferredOpInProgress`**: Re-entrancy guard set during the
-`WM_DEFERRED_REBUILD` dispatch, the `INS_DEFERRED_GUARD` insert path
-(`RefreshNavPane`), and the `Wh_ModSettingsChanged` TIER_REBUILD branch
-around `FullRebuildTree`. Prevents `NM_CUSTOMDRAW` handling, `WM_PAINT`
-deferred ops, and `WM_DEFERRED_REBUILD` from running during tree
-mutation.
+**`g_deferredOpInProgress`** (`thread_local bool`): Re-entrancy guard
+set during the `WM_DEFERRED_REBUILD` dispatch, the `INS_DEFERRED_GUARD`
+insert path (`RefreshNavPane`), and the `WM_SETTINGS_CHANGED`
+TIER_REBUILD handler. Prevents `WM_PAINT` deferred ops and
+`WM_DEFERRED_REBUILD` from running during tree mutation. `thread_local`
+(along with `g_pendingRebuildTrees`) so each UI thread's rebuild does
+not block other threads' dispatches.
 
 ### Architecture
 
@@ -144,16 +151,19 @@ mutation.
   via the hook. When the hidden root (rootStyle & 0x1) is added, uses
   `InsertionScope` + `BuildItemOrder` + `InsertItems` to add
   Desktop/This PC as children via `TVI_FIRST`. Uses `g_inCustomAppend`
-  (static, not thread_local) as a re-entrancy guard.
+  (`thread_local`) as a re-entrancy guard.
 
-- **g_ins** (`static InsertionCtx`): Consolidates the per-insert
+- **g_ins** (`thread_local InsertionCtx`): Consolidates the per-insert
   globals into one struct: `{ int item = -1; void* pNsc; unsigned long
   enumFlags; IShellItemFilter* filter; HWND forTree; }`. `g_ins.item`
   identifies which item is being inserted so the `TVM_INSERTITEM`
   handler can cache the HTREEITEM without comparing localized text.
   Values: `-1=none`, `NAV_THISPC=0`, `NAV_DESKTOP=1`, `NAV_HOME=2`,
   `NAV_GALLERY=3`. Cleared inside the handler after caching.
-  `g_ins.forTree` scopes the insert to one tree HWND.
+  `g_ins.forTree` scopes the insert to one tree HWND. `thread_local`
+  because multiple Explorer windows can run on different STA threads;
+  without it, concurrent `AppendRoot`/`FullRebuildTree` calls clobber
+  each other's `g_ins` state, corrupting COM pointers and crashing.
 
 - **FindSectionLayout** (replaces old `CacheHomeGalleryHandles`):
   Fallback walk for Home/Gallery handles that couldn't be cached via the
@@ -172,6 +182,8 @@ mutation.
   (separator collapse + hidden item clamping + Home/Gallery iIntegral
   clamping), interaction blocking on the hidden item (`GetHiddenItem`:
   click, context menu, cursor, keyboard skip), `WM_DEFERRED_REBUILD`,
+  `WM_SETTINGS_CHANGED` (marshaled settings tier dispatch),
+  `WM_RESTORE_TREE` (marshaled tree restoration),
   `WM_PAINT` (deferred work dispatch, dedup, Home/Gallery removal, handle
   caching via `FindSectionLayout`, iIntegral collapse, Home spacer
   trigger, visible dup collapse, pin hiding, chevrons, SEP-VERIFY), and
@@ -198,13 +210,17 @@ mutation.
   hooks work.
 
 - **Hot disable** (`Wh_ModUninit` via `RestoreTree`): Snapshots all tree
-  HWNDs, then for each: removes the Home spacer (if any) via
-  `RemoveRoot`, `RemoveInsertableRoots` via `RootShellItems`,
-  `AppendRoot_orig` for hidden root with zeroed settings (hook passes
-  through), collapses expanded duplicates. Restores
-  `savedStateImageList` for pin icons. Removes `TreeInteractionProc`
-  subclass. Releases COM refs only for trees with `ownsNscRef=true`.
-  Removes all parent subclasses. Clears `g_trees`.
+  HWNDs (under `g_treesMutex`), then for each: sets `g_mutatingTree`
+  (suppresses `TVN_SELCHANGED` navigation), removes the Home spacer
+  (if any) via `RemoveRoot`, `RemoveInsertableRoots` via
+  `RootShellItems`, `AppendRoot_orig` for hidden root with zeroed
+  settings (hook passes through), collapses expanded duplicates.
+  Restores `savedStateImageList` for pin icons. Removes
+  `TreeInteractionProc` via `RemoveWindowSubclassFromAnyThread`.
+  Cleans up `RemovePropW` for `WH_NscTree`/`WH_EnumFlags`. Releases
+  COM refs only for trees with `ownsNscRef=true`. Removes all parent
+  subclasses. Clears `g_trees` under lock. Straggler loop releases
+  any `pFilter` or `pNscTree` refs that `RestoreTree` didn't reach.
 
 ### Separator system
 
@@ -329,11 +345,26 @@ bottom and no hidden item and the boundary exists), the walk sets
   Home/Gallery).
 
 - **Hidden item interaction blocking** (`TreeInteractionProc`): A
-  `SetWindowSubclass` callback installed on the tree during WM_PAINT
-  when `GetHiddenItem(ts)` is set. Blocks right-click, right-button-up,
+  `WH_SUBCLASSPROC` callback installed via
+  `SetWindowSubclassFromAnyThread` on the tree during WM_PAINT when
+  `GetHiddenItem(ts)` is set. Blocks right-click, right-button-up,
   and mouse-move on the hidden item. The `SubClassTreeWndProc_hook`
   handler also blocks left-click, context menu, and cursor changes,
-  and skips it on VK_UP/VK_DOWN keyboard navigation.
+  and skips it on VK_UP/VK_DOWN keyboard navigation. Removed via
+  `RemoveWindowSubclassFromAnyThread` in `RestoreTree`.
+
+- **Navigation suppression** (`SepParentSubclassProc`): During tree
+  mutations (`FullRebuildTree`, `RestoreTree`), `RemoveRoot` destroys
+  tree items including the selected one. SysTreeView32 auto-selects
+  adjacent items, firing `TVN_SELCHANGED` to the parent, which would
+  cause Explorer to navigate via `BrowseObject`. The parent subclass
+  suppresses `TVN_SELCHANGEDW`/`TVN_SELCHANGEDA` when `hTree ==
+  g_mutatingTree`, preventing navigation. `EnsureParentSubclass` is
+  called at the top of `FullRebuildTree` so the parent subclass is
+  installed before the first rebuild (not deferred to `WM_PAINT`).
+  Side effect: the tree's internal selection still cascades to the
+  last remaining item, so the visual selection may land on the hidden
+  boundary item after a rebuild; this is cosmetic.
 
 ### Separator color lifecycle (`g_sepColor`)
 
@@ -371,9 +402,12 @@ load-bearing because Explorer overpaints unpredictably.
 ### Settings change handling (`Wh_ModSettingsChanged`)
 
 Uses `ClassifySettingsChange(prev, cur)` to determine the appropriate
-tier. Snapshots all tree HWNDs from `g_trees` into a `std::vector`,
-then applies the tier to **each tree**. The snapshot is required because
-`FullRebuildTree` pumps messages and can rehash `g_trees`.
+tier. Runs on the engine thread; marshals work to UI threads via
+`SendMessage(hTree, WM_SETTINGS_CHANGED, 0, (LPARAM)&info)` where
+`SettingsChangeInfo` carries the tier, previous settings, and whether
+separators changed. The `SubClassTreeWndProc_hook` handler dispatches
+the tier on the owning UI thread, ensuring all COM calls and tree
+mutations happen on the correct STA thread.
 
 Three tiers of response (`ChangeTier` enum) based on what changed:
 
@@ -434,11 +468,36 @@ flag in a `DEFER_MASK` is still set.
 while `g_deferredOpInProgress` was true get re-posted after the guard
 drops.
 
+`WM_SETTINGS_CHANGED` (`WM_APP + 0x102`) is sent synchronously by
+`Wh_ModSettingsChanged` (engine thread) to each tree. The
+`SubClassTreeWndProc_hook` handler dispatches the appropriate tier
+(REBUILD/REFRESH/REPAINT) on the owning UI thread.
+
+`WM_RESTORE_TREE` (`WM_APP + 0x103`) is defined for marshaled tree
+restoration but currently unused; `Wh_ModUninit` calls `RestoreTree`
+directly because inline hooks may be removed before a marshaled
+message is dispatched.
+
 ### Critical cross-thread details
 
-- `g_ins` and `g_inCustomAppend` are `static` (not `thread_local`).
-  `Wh_ModInit`/`Wh_ModAfterInit` run on the loader thread; hooks fire on
-  the UI thread. `thread_local` makes the UI thread see default values.
+- `g_ins`, `g_inCustomAppend`, and `g_spacerInsertAfter` are
+  `thread_local`. Each UI thread (STA) gets its own copy; concurrent
+  `AppendRoot`/`FullRebuildTree` calls on different threads cannot
+  clobber each other's insertion state. The loader thread
+  (`Wh_ModInit`/`Wh_ModAfterInit`) never reads or writes these
+  variables; it only posts `WM_DEFERRED_REBUILD`, and the actual
+  insertion work happens on UI threads.
+
+- `g_trees` is guarded by `std::recursive_mutex g_treesMutex`. All
+  accesses (find, try_emplace, erase, iteration, clear) hold the lock.
+  The lock is released before any `SendMessage`, COM call, or blocking
+  operation to avoid deadlock.
+
+- `Wh_ModSettingsChanged` runs on the engine thread but marshals
+  tier dispatch to each tree's UI thread via `SendMessage(hTree,
+  WM_SETTINGS_CHANGED)`. `Wh_ModUninit` calls `RestoreTree` directly
+  (not marshaled) because Windhawk may remove inline hooks before a
+  marshaled message is dispatched.
 
 - `AppendRoot_orig` is a trampoline that bypasses the inline hook. COM
   vtable calls also bypass it. Only Explorer's own internal calls go
