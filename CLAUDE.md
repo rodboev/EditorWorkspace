@@ -15,7 +15,7 @@ in `ExplorerFrame.dll`.
 |------|---------|
 | `AppData\EditorWorkspace\mod.wh.cpp` | **Working file** — opened when you click "Edit" in Windhawk. Ephemeral: Windhawk replaces it each time. |
 | `AppData\ModsSource\local@add-virtual-folders-to-nav-top.wh.cpp` | Persistent local copy. This is what gets pushed to the fork. |
-| `C:\Dropbox\Projects\windhawk-mods-fork\` | GitHub fork clone (`rodboev/windhawk-mods`, branch `add-virtual-folders-to-nav-top`). PR #4159 to `ramensoftware/windhawk-mods`. |
+| `C:\Dropbox\Projects\windhawk-mods-fork\` | GitHub fork clone (`rodboev/windhawk-mods`, branch `add-virtual-folders-to-nav-top`). Original submission was PR #4159 (merged). |
 
 ### Data model
 
@@ -571,6 +571,15 @@ When a cascade occurs:
    (e.g., g_inSubclassProc in WM_PAINT blocked NM_CUSTOMDRAW
    separator painting). Treat a guard that "also fixes" a cascade
    with suspicion; the cascade fix is probably elsewhere.
+
+### Updating the mod in the upstream repo
+
+PR #4159 (original submission) is merged. To publish updates:
+
+1. Sync the fork's `main` with `upstream/main` (`git fetch upstream && git merge upstream/main`)
+2. Create a new branch from `main` for the update
+3. Cherry-pick the EditorWorkspace commit(s) into the fork branch using `git cherry-pick` (with path rewriting via `git format-patch` + `git am` if needed). **Never copy the working file from disk** — Windhawk overwrites `mod.wh.cpp` at any time, so the on-disk file may differ from the committed version. "Replay commits", "reflect changes", and similar phrases all mean cherry-pick the commit itself. This is irreversible once pushed.
+4. Open a new PR against `ramensoftware/windhawk-mods`. Title format: `Add This PC and Desktop to Nav Top: <short description>`. Body is conversational, no section headers. Reference issues if relevant but don't claim fixes for unreproduced bugs.
 
 ### Workflow/constraints
 
