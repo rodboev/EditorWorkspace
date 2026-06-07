@@ -2,7 +2,7 @@
 // @id              ep-taskbar-button-width
 // @name            ExplorerPatcher Taskbar Button Width
 // @description     Customize the minimum width of taskbar buttons when using ExplorerPatcher's Windows 10 taskbar
-// @version         1.1.1
+// @version         1.1.2
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         explorer.exe
@@ -23,8 +23,6 @@ After (120%):
 
 ![After](https://i.imgur.com/qHaRdVt.png)
 
-Enter a percentage where `100%` maps to `160px` before DPI scaling.
-
 (The registry hack at
 `HKCU\Control Panel\Desktop\WindowMetrics\MinWidth` doesn't work with
 ExplorerPatcher.)
@@ -37,7 +35,7 @@ ExplorerPatcher.)
 /*
 - buttonWidthPercent: 120
   $name: Button width (%)
-  $description: "Default: 120%. 100% = 160px before DPI scaling"
+  $description: "Default: 120%"
 */
 // ==/WindhawkModSettings==
 
@@ -136,6 +134,42 @@ int GetTaskButtonGroupCount(void* pTaskListWnd) {
     return *(int*)list;
 }
 
+int GetRequestedMaxItemsPerRow(int rowWidth, int scaledPixels) {
+    if (rowWidth <= 0 || scaledPixels <= 0) {
+        return 0;
+    }
+
+    int requestedMaxItemsPerRow = rowWidth / scaledPixels;
+    return requestedMaxItemsPerRow > 0 ? requestedMaxItemsPerRow : 1;
+}
+
+int GetPreferredMaxItemsPerRow(int rowWidth, int scaledPixels, int taskCount,
+                               int requestedMaxItemsPerRow) {
+    if (requestedMaxItemsPerRow <= 0) {
+        return 0;
+    }
+
+    int preferredMaxItemsPerRow = requestedMaxItemsPerRow;
+    if (taskCount > requestedMaxItemsPerRow &&
+        rowWidth > 0 && scaledPixels > 0) {
+        int narrowerMaxItemsPerRow = requestedMaxItemsPerRow + 1;
+        int currentWidth = rowWidth / requestedMaxItemsPerRow;
+        int narrowerWidth = rowWidth / narrowerMaxItemsPerRow;
+        int currentDelta = currentWidth > scaledPixels
+                               ? currentWidth - scaledPixels
+                               : scaledPixels - currentWidth;
+        int narrowerDelta = narrowerWidth > scaledPixels
+                                ? narrowerWidth - scaledPixels
+                                : scaledPixels - narrowerWidth;
+
+        if (narrowerDelta < currentDelta) {
+            preferredMaxItemsPerRow = narrowerMaxItemsPerRow;
+        }
+    }
+
+    return preferredMaxItemsPerRow;
+}
+
 int WINAPI GetNormalizedButtonWidth_Hook(void* pThis, int groupType, int index) {
     if (g_recomputeLayoutDepth > 0) {
         g_recomputeLayoutNormCalls++;
@@ -175,6 +209,22 @@ int WINAPI GetRequiredRows_Hook(void* pThis, int availableSpace, int height) {
     }
 
     int result = GetRequiredRows_Original(pThis, availableSpace, height);
+    int logicalPixels = GetLogicalWidthPx();
+    if (logicalPixels > 0 && availableSpace > 0 && result > 1) {
+        int scaledPixels = GetScaledWidthPx();
+        int taskCount = GetTaskButtonGroupCount(pThis);
+        int requestedMaxItemsPerRow = GetRequestedMaxItemsPerRow(availableSpace, scaledPixels);
+        int preferredMaxItemsPerRow = GetPreferredMaxItemsPerRow(
+            availableSpace, scaledPixels, taskCount, requestedMaxItemsPerRow);
+
+        if (preferredMaxItemsPerRow > 0 && taskCount > 0) {
+            int preferredRows = (taskCount + preferredMaxItemsPerRow - 1) / preferredMaxItemsPerRow;
+            if (preferredRows > 0 && preferredRows < result) {
+                result = preferredRows;
+            }
+        }
+    }
+
     if (g_recomputeLayoutDepth > 0) {
         g_layoutRequiredRows = result;
     }
@@ -202,41 +252,60 @@ int WINAPI RecomputeLayoutRow_Hook(void* pThis, int a1, int a2, int a3, int a4,
     int adjustedWidth = 0;
     RECT adjustedRect{};
     RECT* rowRectForOriginal = rowRect;
-    int maxItemsPerRow = 0;
+    int rowWidth = 0;
+    int requestedMaxItemsPerRow = 0;
+    int maxRowItems = 0;
     int rowItems = 0;
+    int fitMode = 0;
 
     int logicalPixels = GetLogicalWidthPx();
     if (logicalPixels > 0 && rowCount > 1 && taskCount > rowCount &&
         rowIndex >= 0 && rowIndex < rowCount) {
-        if (rowRect) {
-            int rowWidth = rowRect->right - rowRect->left;
-            int scaledPixels = GetScaledWidthPx();
+        int scaledPixels = GetScaledWidthPx();
 
-            if (rowWidth > 0 && scaledPixels > 0) {
-                maxItemsPerRow = rowWidth / scaledPixels;
-                if (maxItemsPerRow < 1) {
-                    maxItemsPerRow = 1;
-                }
-            }
+        if (rowRect) {
+            rowWidth = rowRect->right - rowRect->left;
+            requestedMaxItemsPerRow = GetRequestedMaxItemsPerRow(rowWidth, scaledPixels);
         }
 
-        if (maxItemsPerRow > 0) {
-            int startIndex = rowIndex * maxItemsPerRow;
-            if (startIndex < taskCount) {
-                int remainingItems = taskCount - startIndex;
-                int remainingRows = rowCount - rowIndex;
-                rowItems = remainingItems;
-                if (rowItems > maxItemsPerRow) {
-                    rowItems = maxItemsPerRow;
-                }
-                int minItemsToLeave = remainingRows - 1;
-                if (remainingItems - rowItems < minItemsToLeave) {
-                    rowItems = remainingItems - minItemsToLeave;
-                }
-                if (rowItems < 1) {
-                    rowItems = 1;
+        if (requestedMaxItemsPerRow > 0 && taskCount > requestedMaxItemsPerRow) {
+            int startIndex = -1;
+            int totalRequestedCapacity = requestedMaxItemsPerRow * rowCount;
+
+            if (totalRequestedCapacity >= taskCount) {
+                maxRowItems = GetPreferredMaxItemsPerRow(
+                    rowWidth, scaledPixels, taskCount, requestedMaxItemsPerRow);
+                if (maxRowItems > requestedMaxItemsPerRow) {
+                    fitMode = 2;
                 }
 
+                startIndex = rowIndex * maxRowItems;
+                if (startIndex < taskCount) {
+                    int remainingItems = taskCount - startIndex;
+                    int remainingRows = rowCount - rowIndex;
+                    rowItems = remainingItems;
+                    if (rowItems > maxRowItems) {
+                        rowItems = maxRowItems;
+                    }
+                    int minItemsToLeave = remainingRows - 1;
+                    if (remainingItems - rowItems < minItemsToLeave) {
+                        rowItems = remainingItems - minItemsToLeave;
+                    }
+                    if (rowItems < 1) {
+                        rowItems = 1;
+                    }
+                }
+            } else {
+                fitMode = 1;
+                int baseItemsPerRow = taskCount / rowCount;
+                int rowsWithExtraItem = taskCount % rowCount;
+                maxRowItems = baseItemsPerRow + (rowsWithExtraItem > 0 ? 1 : 0);
+                startIndex = rowIndex * baseItemsPerRow +
+                             (rowIndex < rowsWithExtraItem ? rowIndex : rowsWithExtraItem);
+                rowItems = baseItemsPerRow + (rowIndex < rowsWithExtraItem ? 1 : 0);
+            }
+
+            if (startIndex >= 0 && startIndex < taskCount && rowItems > 0) {
                 a2 = startIndex;
                 a4 = startIndex + rowItems - 1;
                 a5 = (rowIndex + 1 < rowCount) ? 0 : -1;
@@ -244,10 +313,9 @@ int WINAPI RecomputeLayoutRow_Hook(void* pThis, int a1, int a2, int a3, int a4,
         }
 
         if (rowRect) {
-            int rowWidth = rowRect->right - rowRect->left;
-            if (rowItems > 0 && maxItemsPerRow > 0 && rowItems < maxItemsPerRow &&
+            if (rowItems > 0 && maxRowItems > 0 && rowItems < maxRowItems &&
                 rowWidth > 0) {
-                adjustedWidth = MulDiv(rowWidth, rowItems, maxItemsPerRow);
+                adjustedWidth = MulDiv(rowWidth, rowItems, maxRowItems);
                 if (adjustedWidth > 0 && adjustedWidth < rowWidth) {
                     adjustedRect = *rowRect;
                     adjustedRect.right = adjustedRect.left + adjustedWidth;
@@ -262,16 +330,18 @@ int WINAPI RecomputeLayoutRow_Hook(void* pThis, int a1, int a2, int a3, int a4,
         RECT* loggedRect = rowRectForOriginal;
         if (loggedRect) {
             int rowWidth = loggedRect->right - loggedRect->left;
-            Wh_Log(L"[DBG rowlayout] this=%04X row=%d/%d args=%d,%d,%d,%d,%d orig=%d,%d,%d cap=%d items=%d width=%d adjWidth=%d rect=(%ld,%ld)-(%ld,%ld) scaled=%d result=%d",
+            Wh_Log(L"[DBG rowlayout] this=%04X row=%d/%d args=%d,%d,%d,%d,%d orig=%d,%d,%d cap=%d targetCap=%d fit=%d items=%d width=%d adjWidth=%d rect=(%ld,%ld)-(%ld,%ld) scaled=%d result=%d",
                    PtrTail(pThis), rowIndex + 1, rowCount, a1, a2, a3, a4, a5,
-                   originalA2, originalA4, originalA5, maxItemsPerRow, rowItems,
+                   originalA2, originalA4, originalA5, maxRowItems, requestedMaxItemsPerRow,
+                   fitMode, rowItems,
                    rowWidth, adjustedWidth,
                    loggedRect->left, loggedRect->top, loggedRect->right, loggedRect->bottom,
                    GetScaledWidthPx(), result);
         } else {
-            Wh_Log(L"[DBG rowlayout] this=%04X row=%d/%d args=%d,%d,%d,%d,%d orig=%d,%d,%d cap=%d items=%d rect=null scaled=%d result=%d",
+            Wh_Log(L"[DBG rowlayout] this=%04X row=%d/%d args=%d,%d,%d,%d,%d orig=%d,%d,%d cap=%d targetCap=%d fit=%d items=%d rect=null scaled=%d result=%d",
                    PtrTail(pThis), rowIndex + 1, rowCount, a1, a2, a3, a4, a5,
-                   originalA2, originalA4, originalA5, maxItemsPerRow, rowItems,
+                   originalA2, originalA4, originalA5, maxRowItems, requestedMaxItemsPerRow,
+                   fitMode, rowItems,
                    GetScaledWidthPx(), result);
         }
     }
@@ -446,7 +516,6 @@ void LoadSettings() {
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"=== EP Taskbar Button Width v1.0.1 ===");
     LoadSettings();
 
     HMODULE hMods[1024];
