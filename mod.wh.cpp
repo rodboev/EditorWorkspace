@@ -2,7 +2,7 @@
 // @id              ep-taskbar-button-width
 // @name            ExplorerPatcher Taskbar Button Width
 // @description     Customize the minimum width of taskbar buttons when using ExplorerPatcher's Windows 10 taskbar
-// @version         1.1.0
+// @version         1.1.1
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         explorer.exe
@@ -45,64 +45,33 @@ ExplorerPatcher.)
 #include <atomic>
 
 std::atomic<int> g_settingsPercent{120};
-std::atomic<int> g_settingsPixels{0};
+std::atomic<int> g_logicalWidthPx{0};
 
 std::atomic<bool> g_hooked{false};
-std::atomic<int> g_computeLogCount{0};
-std::atomic<int> g_minLogCount{0};
-std::atomic<int> g_widthLogCount{0};
 std::atomic<int> g_normLogCount{0};
-std::atomic<int> g_colsLogCount{0};
 std::atomic<int> g_rowsLogCount{0};
-std::atomic<int> g_normsLogCount{0};
-std::atomic<int> g_spaceLogCount{0};
 std::atomic<int> g_rowLayoutLogCount{0};
-std::atomic<int> g_colLayoutLogCount{0};
 std::atomic<int> g_recomputeLayoutLogCount{0};
 
 thread_local int g_recomputeLayoutDepth = 0;
 thread_local int g_recomputeLayoutRowCalls = 0;
-thread_local int g_recomputeLayoutColCalls = 0;
 thread_local int g_recomputeLayoutNormCalls = 0;
-thread_local int g_recomputeLayoutNormsCalls = 0;
-thread_local int g_recomputeLayoutComputeCalls = 0;
 thread_local int g_recomputeLayoutRowsCalls = 0;
-thread_local int g_recomputeLayoutColsCalls = 0;
-thread_local int g_recomputeLayoutSpaceCalls = 0;
 thread_local int g_layoutRequiredRows = 1;
 thread_local int g_layoutRowCallIndex = 0;
 
 using ComputeSingleButtonWidth_t = int(WINAPI*)(void* pThis, int groupType, void* pTaskBtnGroup, int* pWidth);
 ComputeSingleButtonWidth_t ComputeSingleButtonWidth_Original;
 
-using GetMinButtonWidth_t = int(WINAPI*)(void* pThis);
-GetMinButtonWidth_t GetMinButtonWidth_Original;
-
-using GetButtonWidth_t = int(WINAPI*)(void* pThis, int* pWidth);
-GetButtonWidth_t GetButtonWidth_Original;
-
 using GetNormalizedButtonWidth_t = int(WINAPI*)(void* pThis, int groupType, int index);
 GetNormalizedButtonWidth_t GetNormalizedButtonWidth_Original;
-
-using GetRequiredCols_t = int(WINAPI*)(void* pThis, int availableSpace);
-GetRequiredCols_t GetRequiredCols_Original;
 
 using GetRequiredRows_t = int(WINAPI*)(void* pThis, int availableSpace, int height);
 GetRequiredRows_t GetRequiredRows_Original;
 
-using GetNormalizedButtonWidths_t = int(WINAPI*)(void* pThis, int groupType, int rowOrCol);
-GetNormalizedButtonWidths_t GetNormalizedButtonWidths_Original;
-
-using GetAvailableSpace_t = int(WINAPI*)(void* pThis);
-GetAvailableSpace_t GetAvailableSpace_Original;
-
 using RecomputeLayoutRow_t =
     int(WINAPI*)(void* pThis, int a1, int startIndex, int a3, int a4, int endIndex, RECT* rowRect);
 RecomputeLayoutRow_t RecomputeLayoutRow_Original;
-
-using RecomputeLayoutColumn_t =
-    int(WINAPI*)(void* pThis, int a1, int startIndex, int a3, int a4, int endIndex, RECT* colRect);
-RecomputeLayoutColumn_t RecomputeLayoutColumn_Original;
 
 using RecomputeLayout_t = int(WINAPI*)(void* pThis);
 RecomputeLayout_t RecomputeLayout_Original;
@@ -135,26 +104,19 @@ unsigned int PtrTail(const void* p) {
 }
 
 void ResetDebugLogCounters() {
-    g_computeLogCount.store(0);
-    g_minLogCount.store(0);
-    g_widthLogCount.store(0);
     g_normLogCount.store(0);
-    g_colsLogCount.store(0);
     g_rowsLogCount.store(0);
-    g_normsLogCount.store(0);
-    g_spaceLogCount.store(0);
     g_rowLayoutLogCount.store(0);
-    g_colLayoutLogCount.store(0);
     g_recomputeLayoutLogCount.store(0);
 }
 
-int GetConfiguredPixelWidth() {
-    int pixels = g_settingsPixels.load();
+int GetScaledWidthPx() {
+    int pixels = g_logicalWidthPx.load();
     return pixels > 0 ? ScalePixelsForDpi(pixels) : 0;
 }
 
-int GetConfiguredLogicalWidth() {
-    return g_settingsPixels.load();
+int GetLogicalWidthPx() {
+    return g_logicalWidthPx.load();
 }
 
 void* GetTaskListWndFromTaskBtnGroup(void* pTaskBtnGroup) {
@@ -174,62 +136,15 @@ int GetTaskButtonGroupCount(void* pTaskListWnd) {
     return *(int*)list;
 }
 
-int WINAPI ComputeSingleButtonWidth_Hook(void* pThis, int groupType, void* pTaskBtnGroup, int* pWidth) {
-    if (g_recomputeLayoutDepth > 0) {
-        g_recomputeLayoutComputeCalls++;
-    }
-
-    int result = ComputeSingleButtonWidth_Original(pThis, groupType, pTaskBtnGroup, pWidth);
-    int originalResult = result;
-    int originalWidth = pWidth ? *pWidth : -1;
-
-    if (ShouldLogSample(g_computeLogCount)) {
-        Wh_Log(L"[DBG compute] groupType=%d btnGroup=%04X originalResult=%d originalWidth=%d final=%d mode=passthrough",
-               groupType, PtrTail(pTaskBtnGroup), originalResult, originalWidth, result);
-    }
-
-    return result;
-}
-
-int WINAPI GetMinButtonWidth_Hook(void* pThis) {
-    int originalResult = GetMinButtonWidth_Original(pThis);
-    int logicalPixels = GetConfiguredLogicalWidth();
-    if (logicalPixels > 0) {
-        if (ShouldLogSample(g_minLogCount)) {
-            Wh_Log(L"[DBG min] this=%04X original=%d final=%d mode=passthrough",
-                   PtrTail(pThis), originalResult, originalResult);
-        }
-        return originalResult;
-    }
-
-    return originalResult;
-}
-
-int WINAPI GetButtonWidth_Hook(void* pThis, int* pWidth) {
-    int result = GetButtonWidth_Original(pThis, pWidth);
-    int originalResult = result;
-    int originalWidth = pWidth ? *pWidth : -1;
-
-    int logicalPixels = GetConfiguredLogicalWidth();
-    if (logicalPixels > 0) {
-        if (ShouldLogSample(g_widthLogCount)) {
-            Wh_Log(L"[DBG width] this=%04X originalResult=%d originalWidth=%d final=%d mode=passthrough",
-                   PtrTail(pThis), originalResult, originalWidth, result);
-        }
-    }
-
-    return result;
-}
-
 int WINAPI GetNormalizedButtonWidth_Hook(void* pThis, int groupType, int index) {
     if (g_recomputeLayoutDepth > 0) {
         g_recomputeLayoutNormCalls++;
     }
 
     int result = GetNormalizedButtonWidth_Original(pThis, groupType, index);
-    int logicalPixels = GetConfiguredLogicalWidth();
+    int logicalPixels = GetLogicalWidthPx();
     if (logicalPixels > 0) {
-        int scaledPixels = GetConfiguredPixelWidth();
+        int scaledPixels = GetScaledWidthPx();
         int translatedWidth = result;
         void* taskListWnd = GetTaskListWndFromTaskBtnGroup(pThis);
 
@@ -254,20 +169,6 @@ int WINAPI GetNormalizedButtonWidth_Hook(void* pThis, int groupType, int index) 
     return result;
 }
 
-int WINAPI GetRequiredCols_Hook(void* pThis, int availableSpace) {
-    if (g_recomputeLayoutDepth > 0) {
-        g_recomputeLayoutColsCalls++;
-    }
-
-    int result = GetRequiredCols_Original(pThis, availableSpace);
-    if (ShouldLogSample(g_colsLogCount, 24)) {
-        Wh_Log(L"[DBG cols] this=%04X available=%d result=%d scaled=%d",
-               PtrTail(pThis), availableSpace, result, GetConfiguredPixelWidth());
-    }
-
-    return result;
-}
-
 int WINAPI GetRequiredRows_Hook(void* pThis, int availableSpace, int height) {
     if (g_recomputeLayoutDepth > 0) {
         g_recomputeLayoutRowsCalls++;
@@ -280,35 +181,7 @@ int WINAPI GetRequiredRows_Hook(void* pThis, int availableSpace, int height) {
 
     if (ShouldLogSample(g_rowsLogCount, 24)) {
         Wh_Log(L"[DBG rows] this=%04X available=%d height=%d result=%d scaled=%d",
-               PtrTail(pThis), availableSpace, height, result, GetConfiguredPixelWidth());
-    }
-
-    return result;
-}
-
-int WINAPI GetNormalizedButtonWidths_Hook(void* pThis, int groupType, int rowOrCol) {
-    if (g_recomputeLayoutDepth > 0) {
-        g_recomputeLayoutNormsCalls++;
-    }
-
-    int result = GetNormalizedButtonWidths_Original(pThis, groupType, rowOrCol);
-    if (ShouldLogSample(g_normsLogCount, 24)) {
-        Wh_Log(L"[DBG norms] this=%04X groupType=%d rowOrCol=%d result=%d scaled=%d",
-               PtrTail(pThis), groupType, rowOrCol, result, GetConfiguredPixelWidth());
-    }
-
-    return result;
-}
-
-int WINAPI GetAvailableSpace_Hook(void* pThis) {
-    if (g_recomputeLayoutDepth > 0) {
-        g_recomputeLayoutSpaceCalls++;
-    }
-
-    int result = GetAvailableSpace_Original(pThis);
-    if (ShouldLogSample(g_spaceLogCount, 24)) {
-        Wh_Log(L"[DBG space] this=%04X result=%d scaled=%d",
-               PtrTail(pThis), result, GetConfiguredPixelWidth());
+               PtrTail(pThis), availableSpace, height, result, GetScaledWidthPx());
     }
 
     return result;
@@ -332,12 +205,12 @@ int WINAPI RecomputeLayoutRow_Hook(void* pThis, int a1, int a2, int a3, int a4,
     int maxItemsPerRow = 0;
     int rowItems = 0;
 
-    int logicalPixels = GetConfiguredLogicalWidth();
+    int logicalPixels = GetLogicalWidthPx();
     if (logicalPixels > 0 && rowCount > 1 && taskCount > rowCount &&
         rowIndex >= 0 && rowIndex < rowCount) {
         if (rowRect) {
             int rowWidth = rowRect->right - rowRect->left;
-            int scaledPixels = GetConfiguredPixelWidth();
+            int scaledPixels = GetScaledWidthPx();
 
             if (rowWidth > 0 && scaledPixels > 0) {
                 maxItemsPerRow = rowWidth / scaledPixels;
@@ -394,35 +267,12 @@ int WINAPI RecomputeLayoutRow_Hook(void* pThis, int a1, int a2, int a3, int a4,
                    originalA2, originalA4, originalA5, maxItemsPerRow, rowItems,
                    rowWidth, adjustedWidth,
                    loggedRect->left, loggedRect->top, loggedRect->right, loggedRect->bottom,
-                   GetConfiguredPixelWidth(), result);
+                   GetScaledWidthPx(), result);
         } else {
             Wh_Log(L"[DBG rowlayout] this=%04X row=%d/%d args=%d,%d,%d,%d,%d orig=%d,%d,%d cap=%d items=%d rect=null scaled=%d result=%d",
                    PtrTail(pThis), rowIndex + 1, rowCount, a1, a2, a3, a4, a5,
                    originalA2, originalA4, originalA5, maxItemsPerRow, rowItems,
-                   GetConfiguredPixelWidth(), result);
-        }
-    }
-
-    return result;
-}
-
-int WINAPI RecomputeLayoutColumn_Hook(void* pThis, int a1, int a2, int a3, int a4,
-                                      int a5, RECT* colRect) {
-    if (g_recomputeLayoutDepth > 0) {
-        g_recomputeLayoutColCalls++;
-    }
-
-    int result = RecomputeLayoutColumn_Original(pThis, a1, a2, a3, a4, a5, colRect);
-    if (ShouldLogSample(g_colLayoutLogCount, 24)) {
-        if (colRect) {
-            int colWidth = colRect->right - colRect->left;
-            Wh_Log(L"[DBG collayout] this=%04X args=%d,%d,%d,%d,%d width=%d rect=(%ld,%ld)-(%ld,%ld) scaled=%d result=%d",
-                   PtrTail(pThis), a1, a2, a3, a4, a5, colWidth,
-                   colRect->left, colRect->top, colRect->right, colRect->bottom,
-                   GetConfiguredPixelWidth(), result);
-        } else {
-            Wh_Log(L"[DBG collayout] this=%04X args=%d,%d,%d,%d,%d rect=null scaled=%d result=%d",
-                   PtrTail(pThis), a1, a2, a3, a4, a5, GetConfiguredPixelWidth(), result);
+                   GetScaledWidthPx(), result);
         }
     }
 
@@ -436,30 +286,19 @@ int WINAPI RecomputeLayout_Hook(void* pThis) {
     g_layoutRequiredRows = 1;
     g_layoutRowCallIndex = 0;
     int savedRowCalls = g_recomputeLayoutRowCalls;
-    int savedColCalls = g_recomputeLayoutColCalls;
     int savedNormCalls = g_recomputeLayoutNormCalls;
-    int savedNormsCalls = g_recomputeLayoutNormsCalls;
-    int savedComputeCalls = g_recomputeLayoutComputeCalls;
     int savedRowsCalls = g_recomputeLayoutRowsCalls;
-    int savedColsCalls = g_recomputeLayoutColsCalls;
-    int savedSpaceCalls = g_recomputeLayoutSpaceCalls;
 
     int result = RecomputeLayout_Original(pThis);
 
     int rowCalls = g_recomputeLayoutRowCalls - savedRowCalls;
-    int colCalls = g_recomputeLayoutColCalls - savedColCalls;
     int normCalls = g_recomputeLayoutNormCalls - savedNormCalls;
-    int normsCalls = g_recomputeLayoutNormsCalls - savedNormsCalls;
-    int computeCalls = g_recomputeLayoutComputeCalls - savedComputeCalls;
     int rowsCalls = g_recomputeLayoutRowsCalls - savedRowsCalls;
-    int colsCalls = g_recomputeLayoutColsCalls - savedColsCalls;
-    int spaceCalls = g_recomputeLayoutSpaceCalls - savedSpaceCalls;
     int count = GetTaskButtonGroupCount(pThis);
 
     if (ShouldLogSample(g_recomputeLayoutLogCount, 24)) {
-        Wh_Log(L"[DBG layout] this=%04X count=%d result=%d compute=%d norm=%d norms=%d cols=%d rows=%d space=%d rowlayout=%d collayout=%d scaled=%d",
-               PtrTail(pThis), count, result, computeCalls, normCalls, normsCalls, colsCalls,
-               rowsCalls, spaceCalls, rowCalls, colCalls, GetConfiguredPixelWidth());
+        Wh_Log(L"[DBG layout] this=%04X count=%d result=%d norm=%d rows=%d rowlayout=%d scaled=%d",
+               PtrTail(pThis), count, result, normCalls, rowsCalls, rowCalls, GetScaledWidthPx());
     }
 
     g_layoutRequiredRows = savedLayoutRequiredRows;
@@ -513,24 +352,12 @@ bool HookExplorerPatcher(HMODULE module, bool calledFromInit) {
 
     void* computeSingleButtonWidthPtr = (void*)GetProcAddress(module,
         "?_ComputeSingleButtonWidth@CTaskListWnd@@IEAAHW4eTBGROUPTYPE@@PEAUITaskBtnGroup@@PEAH@Z");
-    void* getMinButtonWidthPtr = (void*)GetProcAddress(module,
-        "?GetMinButtonWidth@CTaskListWnd@@UEAAHXZ");
-    void* getButtonWidthPtr = (void*)GetProcAddress(module,
-        "?GetButtonWidth@CTaskListWnd@@QEAAHPEAH@Z");
     void* getNormalizedButtonWidthPtr = (void*)GetProcAddress(module,
         "?_GetNormalizedButtonWidth@CTaskBtnGroup@@AEAAHW4eTBGROUPTYPE@@H@Z");
-    void* getRequiredColsPtr = (void*)GetProcAddress(module,
-        "?_GetRequiredCols@CTaskListWnd@@IEAAHH@Z");
     void* getRequiredRowsPtr = (void*)GetProcAddress(module,
         "?_GetRequiredRows@CTaskListWnd@@IEAAHHH@Z");
-    void* getNormalizedButtonWidthsPtr = (void*)GetProcAddress(module,
-        "?_GetNormalizedButtonWidths@CTaskBtnGroup@@AEAAHW4eTBGROUPTYPE@@H@Z");
-    void* getAvailableSpacePtr = (void*)GetProcAddress(module,
-        "?_GetAvailableSpace@CTaskListWnd@@IEAAHXZ");
     void* recomputeLayoutRowPtr = (void*)GetProcAddress(module,
         "?_RecomputeLayoutRow@CTaskListWnd@@IEAAHHHHHHPEAUtagRECT@@@Z");
-    void* recomputeLayoutColumnPtr = (void*)GetProcAddress(module,
-        "?_RecomputeLayoutColumn@CTaskListWnd@@IEAAHHHHHHPEAUtagRECT@@@Z");
     void* recomputeLayoutPtr = (void*)GetProcAddress(module,
         "?_RecomputeLayout@CTaskListWnd@@IEAAHXZ");
 
@@ -540,41 +367,13 @@ bool HookExplorerPatcher(HMODULE module, bool calledFromInit) {
         return false;
     }
 
-    if (!Wh_SetFunctionHook(computeSingleButtonWidthPtr, (void*)ComputeSingleButtonWidth_Hook,
-                            (void**)&ComputeSingleButtonWidth_Original)) {
-        Wh_Log(L"ERROR: Wh_SetFunctionHook failed for _ComputeSingleButtonWidth");
-        g_hooked = false;
-        return false;
-    }
-
-    if (getMinButtonWidthPtr &&
-        !Wh_SetFunctionHook(getMinButtonWidthPtr, (void*)GetMinButtonWidth_Hook,
-                            (void**)&GetMinButtonWidth_Original)) {
-        Wh_Log(L"ERROR: Wh_SetFunctionHook failed for GetMinButtonWidth");
-        g_hooked = false;
-        return false;
-    }
-
-    if (getButtonWidthPtr &&
-        !Wh_SetFunctionHook(getButtonWidthPtr, (void*)GetButtonWidth_Hook,
-                            (void**)&GetButtonWidth_Original)) {
-        Wh_Log(L"ERROR: Wh_SetFunctionHook failed for GetButtonWidth");
-        g_hooked = false;
-        return false;
-    }
+    ComputeSingleButtonWidth_Original =
+        (ComputeSingleButtonWidth_t)computeSingleButtonWidthPtr;
 
     if (getNormalizedButtonWidthPtr &&
         !Wh_SetFunctionHook(getNormalizedButtonWidthPtr, (void*)GetNormalizedButtonWidth_Hook,
                             (void**)&GetNormalizedButtonWidth_Original)) {
         Wh_Log(L"ERROR: Wh_SetFunctionHook failed for _GetNormalizedButtonWidth");
-        g_hooked = false;
-        return false;
-    }
-
-    if (getRequiredColsPtr &&
-        !Wh_SetFunctionHook(getRequiredColsPtr, (void*)GetRequiredCols_Hook,
-                            (void**)&GetRequiredCols_Original)) {
-        Wh_Log(L"ERROR: Wh_SetFunctionHook failed for _GetRequiredCols");
         g_hooked = false;
         return false;
     }
@@ -587,34 +386,10 @@ bool HookExplorerPatcher(HMODULE module, bool calledFromInit) {
         return false;
     }
 
-    if (getNormalizedButtonWidthsPtr &&
-        !Wh_SetFunctionHook(getNormalizedButtonWidthsPtr, (void*)GetNormalizedButtonWidths_Hook,
-                            (void**)&GetNormalizedButtonWidths_Original)) {
-        Wh_Log(L"ERROR: Wh_SetFunctionHook failed for _GetNormalizedButtonWidths");
-        g_hooked = false;
-        return false;
-    }
-
-    if (getAvailableSpacePtr &&
-        !Wh_SetFunctionHook(getAvailableSpacePtr, (void*)GetAvailableSpace_Hook,
-                            (void**)&GetAvailableSpace_Original)) {
-        Wh_Log(L"ERROR: Wh_SetFunctionHook failed for _GetAvailableSpace");
-        g_hooked = false;
-        return false;
-    }
-
     if (recomputeLayoutRowPtr &&
         !Wh_SetFunctionHook(recomputeLayoutRowPtr, (void*)RecomputeLayoutRow_Hook,
                             (void**)&RecomputeLayoutRow_Original)) {
         Wh_Log(L"ERROR: Wh_SetFunctionHook failed for _RecomputeLayoutRow");
-        g_hooked = false;
-        return false;
-    }
-
-    if (recomputeLayoutColumnPtr &&
-        !Wh_SetFunctionHook(recomputeLayoutColumnPtr, (void*)RecomputeLayoutColumn_Hook,
-                            (void**)&RecomputeLayoutColumn_Original)) {
-        Wh_Log(L"ERROR: Wh_SetFunctionHook failed for _RecomputeLayoutColumn");
         g_hooked = false;
         return false;
     }
@@ -633,13 +408,11 @@ bool HookExplorerPatcher(HMODULE module, bool calledFromInit) {
     }
 
     int percent = g_settingsPercent.load();
-    int logicalPixels = g_settingsPixels.load();
-    Wh_Log(L"Hooked width pipeline: compute=%p min=%p width=%p norm=%p cols=%p rows=%p norms=%p space=%p rowlayout=%p collayout=%p layout=%p (%d%% -> %dpx -> %dpx at %d DPI)",
-           computeSingleButtonWidthPtr, getMinButtonWidthPtr, getButtonWidthPtr,
-           getNormalizedButtonWidthPtr, getRequiredColsPtr, getRequiredRowsPtr,
-           getNormalizedButtonWidthsPtr, getAvailableSpacePtr, recomputeLayoutRowPtr,
-           recomputeLayoutColumnPtr, recomputeLayoutPtr,
-           percent, logicalPixels, GetConfiguredPixelWidth(), GetTaskbarDpi());
+    int logicalPixels = g_logicalWidthPx.load();
+    Wh_Log(L"Hooked width pipeline: compute=%p norm=%p rows=%p rowlayout=%p layout=%p (%d%% -> %dpx -> %dpx at %d DPI)",
+           computeSingleButtonWidthPtr, getNormalizedButtonWidthPtr, getRequiredRowsPtr,
+           recomputeLayoutRowPtr, recomputeLayoutPtr,
+           percent, logicalPixels, GetScaledWidthPx(), GetTaskbarDpi());
     return true;
 }
 
@@ -668,7 +441,7 @@ void LoadSettings() {
            percent, logicalPixels, scaledPixels, GetTaskbarDpi());
 
     g_settingsPercent.store(percent);
-    g_settingsPixels.store(logicalPixels);
+    g_logicalWidthPx.store(logicalPixels);
     ResetDebugLogCounters();
 }
 
@@ -707,7 +480,7 @@ void Wh_ModAfterInit() {
 
 void Wh_ModUninit() {
     g_settingsPercent.store(100);
-    g_settingsPixels.store(0);
+    g_logicalWidthPx.store(0);
     RefreshTaskbar();
 }
 
