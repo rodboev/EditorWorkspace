@@ -2,7 +2,7 @@
 // @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's nav
-// @version         1.3.1
+// @version         1.3.2
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         *
@@ -369,6 +369,7 @@ static std::atomic<bool> g_explorerFrameLoaded{false};
 static thread_local bool g_deferredOpInProgress = false;
 static thread_local HWND g_mutatingTree = nullptr;
 static thread_local std::unordered_set<HWND> g_pendingRebuildTrees;
+static std::atomic<bool> g_unloading{false};
 
 #define WM_DEFERRED_REBUILD  (WM_APP + 0x101)
 
@@ -380,6 +381,11 @@ struct SettingsChangeInfo {
     Settings prev;
     bool sepChanged;
 };
+
+static bool IsUnloading()
+{
+    return g_unloading.load(std::memory_order_acquire);
+}
 
 static void DrainPendingRebuilds()
 {
@@ -538,6 +544,9 @@ static void ExpandStartExpandedItems(HWND hTree)
 
 HRESULT THISCALL AppendRoot_hook(void *pThis, IShellItem *psiRoot, unsigned long grfEnumFlags, unsigned long grfRootStyle, IShellItemFilter *pFilter)
 {
+    if (IsUnloading())
+        return AppendRoot_orig(pThis, psiRoot, grfEnumFlags, grfRootStyle, pFilter);
+
     HWND hForTree = nullptr;
     {
         IOleWindow* pOle = nullptr;
@@ -1493,6 +1502,9 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 {
     HWND hTree = (HWND)dwRefData;
 
+    if (IsUnloading() && uMsg != WM_NCDESTROY)
+        return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+
     if (uMsg == WM_NOTIFY && hTree && IsWindow(hTree))
     {
         LPNMHDR hdr = (LPNMHDR)lParam;
@@ -1762,6 +1774,9 @@ SubClassTreeWndProc_t SubClassTreeWndProc_orig;
 
 LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData)
 {
+    if (IsUnloading() && uMsg != WM_NCDESTROY)
+        return SubClassTreeWndProc_orig(hWnd, uMsg, wParam, lParam, uIdSubclass, dwRefData);
+
     // Re-entered messages pass through to avoid deadlocks from other mods' global CallWndProc hooks.
     if (g_inSubclassProc > 0 &&
         uMsg != TVM_INSERTITEMW && uMsg != TVM_INSERTITEMA &&
@@ -2232,6 +2247,9 @@ static thread_local bool g_chevronLogged = false;
 
 HRESULT WINAPI DrawThemeBackground_hook(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, LPCRECT pRect, LPCRECT pClipRect)
 {
+    if (IsUnloading())
+        return DrawThemeBackground_orig(hTheme, hdc, iPartId, iStateId, pRect, pClipRect);
+
     if (iPartId == TVP_GLYPH || iPartId == TVP_HOTGLYPH)
     {
         if (!g_chevronLogged && g_inTreePaint)
@@ -2437,7 +2455,8 @@ void Wh_ModAfterInit();
 static void CheckLateLoadExplorerFrame(LPCWSTR lpLibFileName, HMODULE hModule)
 {
     if (!hModule || !lpLibFileName ||
-        g_explorerFrameLoaded.load(std::memory_order_relaxed))
+        g_explorerFrameLoaded.load(std::memory_order_relaxed) ||
+        IsUnloading())
         return;
     LPCWSTR name = wcsrchr(lpLibFileName, L'\\');
     name = name ? name + 1 : lpLibFileName;
@@ -2470,6 +2489,8 @@ static HMODULE WINAPI LoadLibraryExW_hook(LPCWSTR lpLibFileName, HANDLE hFile, D
 
 BOOL Wh_ModInit()
 {
+    g_unloading.store(false, std::memory_order_release);
+
     HMODULE hExplorerFrame = GetModuleHandleW(L"ExplorerFrame.dll");
     if (!hExplorerFrame)
     {
@@ -2743,55 +2764,59 @@ void Wh_ModSettingsChanged()
     inProgress = false;
 }
 
+static bool RequestTreeRestore(HWND hTree)
+{
+    DWORD_PTR result = 0;
+    LRESULT ok = SendMessageTimeoutW(hTree, WM_RESTORE_TREE, 0, 0,
+                                     SMTO_BLOCK | SMTO_ABORTIFHUNG, 2000, &result);
+    return ok && result == 0x5748;
+}
+
+void Wh_ModBeforeUninit()
+{
+    g_unloading.store(true, std::memory_order_release);
+
+    std::vector<HWND> treeList;
+    std::vector<HWND> parents;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_treesMutex);
+        treeList.reserve(g_trees.size());
+        for (auto& [hTree, ts] : g_trees)
+            treeList.push_back(hTree);
+        parents.assign(g_subclassedParents.begin(), g_subclassedParents.end());
+    }
+
+    for (HWND hTree : treeList)
+    {
+        if (!IsWindow(hTree))
+            continue;
+
+        if (!RequestTreeRestore(hTree))
+        {
+            Wh_Log(L"[UNINIT] tree=%04X restore timed out/unavailable, removing subclasses only",
+                   PTR4(hTree));
+            WindhawkUtils::RemoveWindowSubclassFromAnyThread(hTree, TreeInteractionProc);
+            WindhawkUtils::RemoveWindowSubclassFromAnyThread(hTree, RestoreSubclassProc);
+            RemovePropW(hTree, L"WH_NscTree");
+            RemovePropW(hTree, L"WH_EnumFlags");
+        }
+    }
+
+    for (HWND parent : parents)
+    {
+        if (IsWindow(parent))
+            WindhawkUtils::RemoveWindowSubclassFromAnyThread(parent, SepParentSubclassProc);
+    }
+}
+
 void Wh_ModUninit()
 {
     g_settings = {};
     ResetSepColor();
 
-    std::vector<HWND> uninitList;
     {
         std::lock_guard<std::recursive_mutex> lock(g_treesMutex);
-        uninitList.reserve(g_trees.size());
-        for (auto& [hTree, ts] : g_trees)
-            uninitList.push_back(hTree);
-    }
-
-    for (HWND hTree : uninitList)
-    {
-        if (!IsWindow(hTree))
-            continue;
-
-        DWORD treeThread = GetWindowThreadProcessId(hTree, nullptr);
-        if (treeThread != GetCurrentThreadId())
-        {
-            LRESULT lr = SendMessage(hTree, WM_RESTORE_TREE, 0, 0);
-            if (lr != 0x5748)
-            {
-                Wh_Log(L"[UNINIT] tree=%04X restore subclass missing, direct fallback", PTR4(hTree));
-                g_mutatingTree = hTree;
-                RestoreTree(hTree);
-                g_mutatingTree = nullptr;
-            }
-        }
-        else
-        {
-            g_mutatingTree = hTree;
-            RestoreTree(hTree);
-            g_mutatingTree = nullptr;
-            WindhawkUtils::RemoveWindowSubclassFromAnyThread(hTree, RestoreSubclassProc);
-        }
-    }
-
-    std::vector<HWND> parents;
-    {
-        std::lock_guard<std::recursive_mutex> lock(g_treesMutex);
-        parents.assign(g_subclassedParents.begin(), g_subclassedParents.end());
         g_subclassedParents.clear();
-    }
-    for (HWND parent : parents)
-    {
-        if (IsWindow(parent))
-            WindhawkUtils::RemoveWindowSubclassFromAnyThread(parent, SepParentSubclassProc);
     }
 
     {
