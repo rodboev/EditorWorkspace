@@ -2,7 +2,7 @@
 // @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's nav
-// @version         1.3.2
+// @version         1.3.3
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         *
@@ -197,29 +197,13 @@ enum ChangeTier { TIER_NONE, TIER_REPAINT, TIER_REFRESH, TIER_REBUILD };
 static ULONG_PTR g_gdipToken = 0;
 static std::set<HWND> g_subclassedParents;
 static COLORREF g_sepColor = CLR_INVALID;
+static bool g_sepColorPendingVerify = false;
 static bool g_logSepDraw = true;
 #define PTR4(p) ((unsigned)(uintptr_t)(p) & 0xFFFF)
 
 static void ResetSepColor() {
     g_sepColor = CLR_INVALID;
     g_logSepDraw = true;
-}
-
-static COLORREF GetTreeBgColor(HWND hTree)
-{
-    COLORREF bg = (COLORREF)SendMessageW(hTree, TVM_GETBKCOLOR, 0, 0);
-    if (bg == CLR_INVALID || (int)bg == -1)
-        bg = GetSysColor(COLOR_WINDOW);
-    return bg;
-}
-
-static COLORREF DeriveSepColor(HWND hTree)
-{
-    COLORREF bg = GetTreeBgColor(hTree);
-    int sum = GetRValue(bg) + GetGValue(bg) + GetBValue(bg);
-    int d = (sum < 384) ? 56 : -41;
-    auto cl = [](int v) { return (BYTE)(v < 0 ? 0 : (v > 255 ? 255 : v)); };
-    return RGB(cl(GetRValue(bg) + d), cl(GetGValue(bg) + d), cl(GetBValue(bg) + d));
 }
 
 enum PendingWork : uint8_t {
@@ -247,6 +231,7 @@ struct TreeState {
     uint8_t pendingWork = 0;   // bitmask of PendingWork flags
     int sepRetries = 0;
     bool ownsNscRef = false;
+    bool insertLoggingEnabled = false;
     bool triedHomeSpacer = false;
     HIMAGELIST savedStateImageList = nullptr;
 };
@@ -715,6 +700,21 @@ static bool AreWeMutating()
     return g_deferredOpInProgress || g_inSubclassProc > 0 || g_inCustomAppend;
 }
 
+static void LogDepth1InsertDecision(HWND hWnd, TreeState& ts, HTREEITEM hNew,
+                                    const WCHAR *itemText, bool isHome, bool isGallery,
+                                    bool hasOurItems, bool willRebuild)
+{
+    if (!ts.insertLoggingEnabled)
+        return;
+
+    Wh_Log(L"[INSERT-TRACE] tree=%04X item=%04X text='%s' home=%d gallery=%d ours=%d "
+           L"mut=%d paint=%d fresh=%d pending=0x%02X rebuild=%d",
+           PTR4(hWnd), PTR4(hNew), itemText,
+           (int)isHome, (int)isGallery, (int)hasOurItems,
+           (int)AreWeMutating(), (int)g_inTreePaint, (int)ts.freshFromAppend,
+           ts.pendingWork, (int)willRebuild);
+}
+
 static bool IsDepth1Item(HWND hTree, HTREEITEM h)
 {
     HTREEITEM parent = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM, TVGN_PARENT, (LPARAM)h);
@@ -752,6 +752,34 @@ static void GetItemText(HWND hTree, HTREEITEM h, WCHAR *buf, int len)
     tvi.pszText = buf;
     tvi.cchTextMax = len;
     SendMessageW(hTree, TVM_GETITEMW, 0, (LPARAM)&tvi);
+}
+
+static void LogDepth1SelectionEvent(HWND hTree, TreeState& ts, const WCHAR *phase,
+                                    const NMTREEVIEWW *nm, bool intercepted)
+{
+    if (!ts.insertLoggingEnabled || !nm)
+        return;
+
+    bool oldDepth1 = nm->itemOld.hItem && IsDepth1Item(hTree, nm->itemOld.hItem);
+    bool newDepth1 = nm->itemNew.hItem && IsDepth1Item(hTree, nm->itemNew.hItem);
+    if (!oldDepth1 && !newDepth1)
+        return;
+
+    WCHAR oldText[64] = {};
+    WCHAR newText[64] = {};
+    if (nm->itemOld.hItem)
+        GetItemText(hTree, nm->itemOld.hItem, oldText, ARRAYSIZE(oldText));
+    if (nm->itemNew.hItem)
+        GetItemText(hTree, nm->itemNew.hItem, newText, ARRAYSIZE(newText));
+
+    Wh_Log(L"[SEL-TRACE] %s tree=%04X old=%04X '%s' oldD1=%d new=%04X '%s' newD1=%d "
+           L"action=%d intercept=%d mut=%d paint=%d fresh=%d pending=0x%02X",
+           phase, PTR4(hTree),
+           PTR4(nm->itemOld.hItem), oldText, (int)oldDepth1,
+           PTR4(nm->itemNew.hItem), newText, (int)newDepth1,
+           nm->action, (int)intercepted,
+           (int)AreWeMutating(), (int)g_inTreePaint, (int)ts.freshFromAppend,
+           ts.pendingWork);
 }
 
 template<typename Skip, typename OnMatch>
@@ -1362,7 +1390,7 @@ static void DrawSeparatorLine(HDC hdc, HWND hTree, int sepY)
     int pad = 18;
     int sepLeft = (client.right >= pad * 2 + 8) ? pad : 0;
     int sepRight = (client.right >= pad * 2 + 8) ? client.right - pad : client.right;
-    RECT sepRect = { sepLeft, sepY, sepRight, sepY + 2 };
+    RECT sepRect = { sepLeft, sepY, sepRight, sepY + 1 };
 
     HBRUSH brush = CreateSolidBrush(g_sepColor);
     if (brush)
@@ -1375,11 +1403,78 @@ static void DrawSeparatorLine(HDC hdc, HWND hTree, int sepY)
     }
 }
 
+static COLORREF SampleSeparatorColor(HWND hTree, HDC hdc)
+{
+    if (!hdc || !IsWindow(hTree))
+        return CLR_INVALID;
+
+    RECT client;
+    GetClientRect(hTree, &client);
+    if (client.right <= 0)
+        return CLR_INVALID;
+
+    int baseHeight = GetBaseItemHeight(hTree);
+    if (baseHeight <= 0)
+        return CLR_INVALID;
+
+    int tallThreshold = baseHeight + baseHeight / 2;
+
+    HTREEITEM h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM, TVGN_FIRSTVISIBLE, 0);
+    while (h)
+    {
+        if (IsDepth1Item(hTree, h))
+        {
+            RECT rc = {};
+            if (GetItemRect(hTree, h, &rc))
+            {
+                int ih = rc.bottom - rc.top;
+                if (ih >= tallThreshold)
+                {
+                    int sepY = rc.top + baseHeight / 2;
+                    int sampleX = client.right / 2;
+                    COLORREF bg = GetPixel(hdc, sampleX, rc.top + baseHeight + baseHeight / 4);
+
+                    auto isPlausible = [&](COLORREF c) -> bool {
+                        if (c == CLR_INVALID || c == 0x000000)
+                            return false;
+                        if (bg == CLR_INVALID)
+                            return true;
+                        int dr = abs((int)GetRValue(c) - (int)GetRValue(bg));
+                        int dg = abs((int)GetGValue(c) - (int)GetGValue(bg));
+                        int db = abs((int)GetBValue(c) - (int)GetBValue(bg));
+                        return (dr + dg + db) < 200;
+                    };
+
+                    COLORREF c = GetPixel(hdc, sampleX, sepY);
+                    if (isPlausible(c))
+                        return c;
+
+                    for (int dy = -2; dy <= 2; dy++)
+                    {
+                        c = GetPixel(hdc, sampleX, sepY + dy);
+                        if (isPlausible(c))
+                            return c;
+                    }
+                }
+            }
+        }
+
+        h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM, TVGN_NEXTVISIBLE, (LPARAM)h);
+    }
+
+    return CLR_INVALID;
+}
+
 // Redraws wanted separators at CDDS_POSTPAINT after CDDS_PREPAINT hid all native ones.
 
 static bool HasOurItemsInTree(const TreeState& ts)
 {
     return ts.hItems[NAV_THISPC] || ts.hItems[NAV_DESKTOP];
+}
+
+static bool ShouldDrawManagedSeparators()
+{
+    return !g_settings.removeSepBelowNav || !g_settings.removeSepBelowQA;
 }
 
 static void RedrawSeps(HWND hTree, HDC hdc, TreeState& ts)
@@ -1472,9 +1567,14 @@ static void RedrawSeps(HWND hTree, HDC hdc, TreeState& ts)
                 }
                 else if (foundBoundary && isTall && !foundBelowQA)
                 {
-                    drawSep = true;
-                    sepY = rc.top + baseHeight / 2;
-                    tag = L'S';
+                    if (!g_settings.removeSepBelowQA)
+                    {
+                        drawSep = true;
+                        sepY = rc.top + baseHeight / 2;
+                        tag = L'S';
+                    }
+                    else
+                        tag = L'Q';
                 }
 
                 if (drawSep)
@@ -1514,9 +1614,14 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             {
                 if (hTree == g_mutatingTree || g_inOurSelect || AreWeMutating())
                     return 0;
+                TreeState* ts = GetTree(hTree);
                 LPNMTREEVIEWW nm = (LPNMTREEVIEWW)lParam;
-                if (nm->action != TVC_BYMOUSE && nm->action != TVC_BYKEYBOARD &&
-                    nm->itemNew.hItem && IsDepth1Item(hTree, nm->itemNew.hItem))
+                bool intercept =
+                    nm->action != TVC_BYMOUSE && nm->action != TVC_BYKEYBOARD &&
+                    nm->itemNew.hItem && IsDepth1Item(hTree, nm->itemNew.hItem);
+                if (ts)
+                    LogDepth1SelectionEvent(hTree, *ts, L"changing", nm, intercept);
+                if (intercept)
                 {
                     Wh_Log(L"[SEL-BLOCK] tree=%04X item=%04X action=%d",
                            PTR4(hTree), PTR4(nm->itemNew.hItem), nm->action);
@@ -1528,9 +1633,14 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
             {
                 if (hTree == g_mutatingTree)
                     return 0;
+                TreeState* ts = GetTree(hTree);
                 LPNMTREEVIEWW nm = (LPNMTREEVIEWW)lParam;
-                if (nm->action != TVC_BYMOUSE && nm->action != TVC_BYKEYBOARD &&
-                    nm->itemNew.hItem && IsDepth1Item(hTree, nm->itemNew.hItem))
+                bool intercept =
+                    nm->action != TVC_BYMOUSE && nm->action != TVC_BYKEYBOARD &&
+                    nm->itemNew.hItem && IsDepth1Item(hTree, nm->itemNew.hItem);
+                if (ts)
+                    LogDepth1SelectionEvent(hTree, *ts, L"changed", nm, intercept);
+                if (intercept)
                     return 0;
             }
 
@@ -1541,8 +1651,11 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                 TreeState* ts = GetTree(hTree);
                 if (stage == CDDS_PREPAINT && g_settings.hasItemsAtTop)
                 {
-                    // Only suppress native separators once our items are in this tree.
-                    if (ts && HasOurItemsInTree(*ts))
+                    if (!ShouldDrawManagedSeparators())
+                        return CDRF_NOTIFYPOSTPAINT;
+
+                    if (ts && HasOurItemsInTree(*ts) &&
+                        g_sepColor != CLR_INVALID && !g_sepColorPendingVerify)
                         return CDRF_NOTIFYPOSTPAINT;
                     LRESULT r = DefSubclassProc(hWnd, uMsg, wParam, lParam);
                     return r | CDRF_NOTIFYPOSTPAINT;
@@ -1550,11 +1663,30 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 
                 if (stage == CDDS_POSTPAINT)
                 {
+                    if (g_sepColorPendingVerify && g_sepColor != CLR_INVALID && g_settings.hasItemsAtTop)
+                    {
+                        g_sepColorPendingVerify = false;
+                        COLORREF c = SampleSeparatorColor(hTree, cd->nmcd.hdc);
+                        if (c != CLR_INVALID && c != g_sepColor)
+                        {
+                            Wh_Log(L"[SEP] color changed 0x%06X -> 0x%06X tree=%04X",
+                                   g_sepColor, c, PTR4(hTree));
+                            g_sepColor = c;
+                            g_logSepDraw = true;
+                        }
+                        InvalidateRect(hTree, nullptr, TRUE);
+                    }
+
                     if (g_sepColor == CLR_INVALID && g_settings.hasItemsAtTop)
                     {
-                        g_sepColor = DeriveSepColor(hTree);
-                        g_logSepDraw = true;
-                        Wh_Log(L"[SEP] 0x%06X tree=%04X", g_sepColor, PTR4(hTree));
+                        COLORREF c = SampleSeparatorColor(hTree, cd->nmcd.hdc);
+                        if (c != CLR_INVALID)
+                        {
+                            g_sepColor = c;
+                            g_logSepDraw = true;
+                            Wh_Log(L"[SEP] 0x%06X tree=%04X", c, PTR4(hTree));
+                            InvalidateRect(hTree, nullptr, TRUE);
+                        }
                     }
 
                     HDC hdc = cd->nmcd.hdc;
@@ -1573,9 +1705,9 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                         if (GetItemRect(hTree, hHidden, &rcHide))
                         {
                             HDC hdc = cd->nmcd.hdc;
-                            RECT client;
-                            GetClientRect(hTree, &client);
-                            COLORREF bg = GetTreeBgColor(hTree);
+                            COLORREF bg = GetPixel(hdc, 1, rcHide.top + 2);
+                            if (bg == CLR_INVALID)
+                                bg = GetSysColor(COLOR_WINDOW);
                             HBRUSH bgBrush = CreateSolidBrush(bg);
                             if (bgBrush)
                             {
@@ -1584,11 +1716,13 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                             }
                             if (g_sepColor != CLR_INVALID)
                             {
-                                bool drawSep = (hHidden == ts->homeSpacerItem);
+                                bool drawSep = !g_settings.removeSepBelowNav &&
+                                               (hHidden == ts->homeSpacerItem);
                                 if (!drawSep)
                                 {
                                     HTREEITEM hPrev = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM, TVGN_PREVIOUS, (LPARAM)hHidden);
-                                    drawSep = hPrev && IsOurSection(*ts, hPrev);
+                                    drawSep = !g_settings.removeSepBelowNav &&
+                                              hPrev && IsOurSection(*ts, hPrev);
                                 }
                                 if (drawSep)
                                 {
@@ -1622,7 +1756,7 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
     }
 
     if (uMsg == WM_THEMECHANGED || uMsg == WM_SYSCOLORCHANGE)
-        ResetSepColor();
+        g_sepColorPendingVerify = true;
 
     if (uMsg == WM_NCDESTROY)
     {
@@ -1863,8 +1997,14 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
                     for (int i = NAV_THISPC; i <= NAV_DESKTOP; i++)
                         if (ts->hItems[i]) { hasOurItems = true; break; }
 
-                    if (hasOurItems && !(isHome || isGallery) && !AreWeMutating() && !g_inTreePaint &&
-                        !(ts->pendingWork & WORK_FULL_REBUILD) && !ts->freshFromAppend)
+                    bool willRebuild =
+                        hasOurItems && !(isHome || isGallery) && !AreWeMutating() && !g_inTreePaint &&
+                        !(ts->pendingWork & WORK_FULL_REBUILD) && !ts->freshFromAppend;
+
+                    LogDepth1InsertDecision(hWnd, *ts, hNew, itemText, isHome, isGallery,
+                                            hasOurItems, willRebuild);
+
+                    if (willRebuild)
                     {
                         ts->pendingWork |= WORK_FULL_REBUILD;
                         PostMessage(hWnd, WM_DEFERRED_REBUILD, 0, 0);
@@ -1996,6 +2136,7 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
         {
             ts->freshFromAppend = false;
             ts->sepRetries = 0;
+            ts->insertLoggingEnabled = true;
         }
         g_inSubclassProc--;
         DrainPendingRebuilds();
