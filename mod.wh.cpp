@@ -2,7 +2,7 @@
 // @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's nav
-// @version         1.3.4
+// @version         1.3.6
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         *
@@ -235,6 +235,7 @@ struct TreeState {
     bool insertLoggingEnabled = false;
     bool triedHomeSpacer = false;
     HIMAGELIST savedStateImageList = nullptr;
+    std::unordered_set<HTREEITEM> allowedGlyphItems;
 };
 static std::unordered_map<HWND, TreeState> g_trees;
 static std::recursive_mutex g_treesMutex;
@@ -336,6 +337,7 @@ static void ResetTreeCleanup(TreeState& ts)
     ts.freshFromAppend = false;
     ts.triedHomeSpacer = false;
     ts.pendingWork = WORK_QA_CLEANUP | WORK_HG_CLEANUP | WORK_DUP_COLLAPSE;
+    ts.allowedGlyphItems.clear();
 }
 
 // Globals bridging AppendRoot_hook to TVM_INSERTITEM handler.
@@ -728,6 +730,13 @@ struct SuppressedChevronState {
 };
 static thread_local SuppressedChevronState g_suppressedChevron;
 
+struct UserSelectionHint {
+    HWND hTree = nullptr;
+    HTREEITEM hItem = nullptr;
+    ULONGLONG tick = 0;
+};
+static thread_local UserSelectionHint g_userSelectionHint;
+
 static bool AreWeMutating()
 {
     return g_deferredOpInProgress || g_inSubclassProc > 0 || g_inCustomAppend;
@@ -978,6 +987,66 @@ static bool ItemCanLegitimatelyShowChevron(HWND hTree, TreeState *ts, HTREEITEM 
     return false;
 }
 
+static bool IsSuppressionWindowActive(HWND hTree)
+{
+    if (!hTree || g_suppressedChevron.hTree != hTree || !g_suppressedChevron.hItem)
+        return false;
+
+    ULONGLONG age = GetTickCount64() - g_suppressedChevron.tick;
+    if (age > 750)
+    {
+        g_suppressedChevron = {};
+        return false;
+    }
+    return true;
+}
+
+static void CaptureUserSelectionHint(HWND hTree, LPARAM lParam)
+{
+    if (!hTree)
+        return;
+
+    POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+    TVHITTESTINFO ht = {};
+    ht.pt = pt;
+    HTREEITEM hHit = (HTREEITEM)SendMessageW(hTree, TVM_HITTEST, 0, (LPARAM)&ht);
+    if (!hHit || !IsDepth1Item(hTree, hHit) || !(ht.flags & TVHT_ONITEM))
+        return;
+
+    g_userSelectionHint = {};
+    g_userSelectionHint.hTree = hTree;
+    g_userSelectionHint.hItem = hHit;
+    g_userSelectionHint.tick = GetTickCount64();
+}
+
+static bool HasRecentUserSelectionHint(HWND hTree, HTREEITEM hItem)
+{
+    if (!hTree || !hItem || g_userSelectionHint.hTree != hTree ||
+        g_userSelectionHint.hItem != hItem)
+        return false;
+
+    ULONGLONG age = GetTickCount64() - g_userSelectionHint.tick;
+    if (age > 750)
+    {
+        g_userSelectionHint = {};
+        return false;
+    }
+    return true;
+}
+
+static void RememberAllowedGlyphItem(HWND hTree, HTREEITEM hItem)
+{
+    if (!hTree || !hItem || !IsDepth1Item(hTree, hItem))
+        return;
+
+    TreeState* ts = GetTree(hTree);
+    if (!ts)
+        return;
+
+    if (!ItemCanLegitimatelyShowChevron(hTree, ts, hItem))
+        ts->allowedGlyphItems.insert(hItem);
+}
+
 static bool ShouldLogChevronTrace(HWND hTree, int partId)
 {
     if (!g_inTreePaint || !hTree)
@@ -1046,18 +1115,15 @@ static void LogChevronTrace(HWND hTree, int partId, int stateId, const RECT& gly
 
 static bool ShouldSuppressGlyphPaint(HWND hTree, HTREEITEM hItem)
 {
-    if (!hTree || !hItem || !IsDepth1Item(hTree, hItem))
-        return false;
-
-    if (g_suppressedChevron.hTree != hTree || g_suppressedChevron.hItem != hItem)
+    if (!IsSuppressionWindowActive(hTree) || !hItem || !IsDepth1Item(hTree, hItem))
         return false;
 
     TreeState* ts = GetTree(hTree);
     if (ItemCanLegitimatelyShowChevron(hTree, ts, hItem))
-    {
-        g_suppressedChevron = {};
         return false;
-    }
+
+    if (ts && ts->allowedGlyphItems.count(hItem))
+        return false;
 
     return true;
 }
@@ -1839,7 +1905,8 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     return 0;
                 TreeState* ts = GetTree(hTree);
                 LPNMTREEVIEWW nm = (LPNMTREEVIEWW)lParam;
-                bool userDriven = nm->action == TVC_BYMOUSE || nm->action == TVC_BYKEYBOARD;
+                bool hinted = HasRecentUserSelectionHint(hTree, nm->itemNew.hItem);
+                bool userDriven = nm->action == TVC_BYMOUSE || nm->action == TVC_BYKEYBOARD || hinted;
                 bool intercept =
                     !userDriven &&
                     nm->itemNew.hItem && IsDepth1Item(hTree, nm->itemNew.hItem);
@@ -1866,12 +1933,15 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     return 0;
                 TreeState* ts = GetTree(hTree);
                 LPNMTREEVIEWW nm = (LPNMTREEVIEWW)lParam;
-                bool userDriven = nm->action == TVC_BYMOUSE || nm->action == TVC_BYKEYBOARD;
+                bool hinted = HasRecentUserSelectionHint(hTree, nm->itemNew.hItem);
+                bool userDriven = nm->action == TVC_BYMOUSE || nm->action == TVC_BYKEYBOARD || hinted;
                 bool intercept =
                     !userDriven &&
                     nm->itemNew.hItem && IsDepth1Item(hTree, nm->itemNew.hItem);
                 if (ts)
                     LogDepth1SelectionEvent(hTree, *ts, L"changed", nm, intercept);
+                if (hinted)
+                    g_userSelectionHint = {};
                 if (userDriven && g_suppressedChevron.hTree == hTree)
                     g_suppressedChevron = {};
                 if (intercept)
@@ -2269,6 +2339,9 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
         }
     }
 
+    if (uMsg == WM_LBUTTONDOWN || uMsg == WM_LBUTTONDBLCLK)
+        CaptureUserSelectionHint(hWnd, lParam);
+
     {
         TreeState* ts = GetTree(hWnd);
         HTREEITEM hiddenDup = ts ? GetHiddenItem(*ts) : nullptr;
@@ -2636,6 +2709,8 @@ HRESULT WINAPI DrawThemeBackground_hook(HTHEME hTheme, HDC hdc, int iPartId, int
         HTREEITEM hItem = FindVisibleItemForGlyphRect(g_treePaintHwnd, *pRect, nullptr,
                                                       nullptr, itemText,
                                                       ARRAYSIZE(itemText));
+        if (!IsSuppressionWindowActive(g_treePaintHwnd))
+            RememberAllowedGlyphItem(g_treePaintHwnd, hItem);
         if (ShouldSuppressGlyphPaint(g_treePaintHwnd, hItem))
         {
             Wh_Log(L"[CHEVRON-SUPPRESS] tree=%04X part=%s state=%s item=%04X '%s' action=%d age=%llu",
