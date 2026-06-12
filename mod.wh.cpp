@@ -2,7 +2,7 @@
 // @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's nav
-// @version         1.3.3
+// @version         1.3.4
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         *
@@ -101,6 +101,7 @@ Before/after:
 #include <commctrl.h>
 #include <windowsx.h>
 #include <uxtheme.h>
+#include <vsstyle.h>
 #include <gdiplus.h>
 #include <atomic>
 #include <mutex>
@@ -690,10 +691,42 @@ static void DrawChevron(HDC hdc, const RECT *r, int partId, int stateId)
 }
 
 static thread_local bool g_inTreePaint = false;
+static thread_local HWND g_treePaintHwnd = nullptr;
 static thread_local int g_inSubclassProc = 0;
 static thread_local bool g_inOurSelect = false;
 static thread_local int g_lastSepY = -1;
 static thread_local int g_firstSepY = -1;
+
+struct SelectionTraceState {
+    HWND hTree = nullptr;
+    HTREEITEM hOld = nullptr;
+    HTREEITEM hNew = nullptr;
+    UINT action = 0;
+    bool intercepted = false;
+    bool changing = false;
+    ULONGLONG tick = 0;
+    WCHAR oldText[64] = {};
+    WCHAR newText[64] = {};
+};
+static thread_local SelectionTraceState g_lastSelectionTrace;
+
+struct ChevronTraceState {
+    HWND hTree = nullptr;
+    HTREEITEM hItem = nullptr;
+    int partId = 0;
+    int stateId = 0;
+    RECT glyphRect = {};
+    ULONGLONG tick = 0;
+};
+static thread_local ChevronTraceState g_lastChevronTrace;
+
+struct SuppressedChevronState {
+    HWND hTree = nullptr;
+    HTREEITEM hItem = nullptr;
+    UINT action = 0;
+    ULONGLONG tick = 0;
+};
+static thread_local SuppressedChevronState g_suppressedChevron;
 
 static bool AreWeMutating()
 {
@@ -772,6 +805,17 @@ static void LogDepth1SelectionEvent(HWND hTree, TreeState& ts, const WCHAR *phas
     if (nm->itemNew.hItem)
         GetItemText(hTree, nm->itemNew.hItem, newText, ARRAYSIZE(newText));
 
+    g_lastSelectionTrace = {};
+    g_lastSelectionTrace.hTree = hTree;
+    g_lastSelectionTrace.hOld = nm->itemOld.hItem;
+    g_lastSelectionTrace.hNew = nm->itemNew.hItem;
+    g_lastSelectionTrace.action = nm->action;
+    g_lastSelectionTrace.intercepted = intercepted;
+    g_lastSelectionTrace.changing = wcscmp(phase, L"changing") == 0;
+    g_lastSelectionTrace.tick = GetTickCount64();
+    lstrcpynW(g_lastSelectionTrace.oldText, oldText, ARRAYSIZE(g_lastSelectionTrace.oldText));
+    lstrcpynW(g_lastSelectionTrace.newText, newText, ARRAYSIZE(g_lastSelectionTrace.newText));
+
     Wh_Log(L"[SEL-TRACE] %s tree=%04X old=%04X '%s' oldD1=%d new=%04X '%s' newD1=%d "
            L"action=%d intercept=%d mut=%d paint=%d fresh=%d pending=0x%02X",
            phase, PTR4(hTree),
@@ -837,6 +881,185 @@ static bool GetItemRect(HWND hTree, HTREEITEM h, RECT *rc)
         return false;
     *(HTREEITEM *)rc = h;
     return SendMessageW(hTree, TVM_GETITEMRECT, FALSE, (LPARAM)rc) != 0;
+}
+
+static const WCHAR* ChevronPartName(int partId)
+{
+    if (partId == TVP_GLYPH)
+        return L"GLYPH";
+    if (partId == TVP_HOTGLYPH)
+        return L"HOTGLYPH";
+    return L"?";
+}
+
+static const WCHAR* ChevronStateName(int partId, int stateId)
+{
+    if (partId == TVP_GLYPH)
+    {
+        if (stateId == GLPS_CLOSED)
+            return L"CLOSED";
+        if (stateId == GLPS_OPENED)
+            return L"OPENED";
+    }
+    if (partId == TVP_HOTGLYPH)
+    {
+        if (stateId == HGLPS_CLOSED)
+            return L"CLOSED";
+        if (stateId == HGLPS_OPENED)
+            return L"OPENED";
+    }
+    return L"?";
+}
+
+static int GetTrackedNavItemId(const TreeState& ts, HTREEITEM hItem)
+{
+    for (int i = 0; i < NAV_COUNT; i++)
+        if (ts.hItems[i] == hItem)
+            return i;
+    return -1;
+}
+
+static HTREEITEM FindVisibleItemForGlyphRect(HWND hTree, const RECT& glyphRect,
+                                             RECT *itemRectOut, bool *depth1Out,
+                                             WCHAR *textOut, int textOutLen)
+{
+    int cy = (glyphRect.top + glyphRect.bottom) / 2;
+    int bestScore = 0x7fffffff;
+    HTREEITEM best = nullptr;
+    RECT bestRect = {};
+
+    HTREEITEM h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM, TVGN_FIRSTVISIBLE, 0);
+    while (h)
+    {
+        RECT itemRect = {};
+        if (GetItemRect(hTree, h, &itemRect))
+        {
+            int score = 0;
+            if (cy < itemRect.top)
+                score = itemRect.top - cy;
+            else if (cy >= itemRect.bottom)
+                score = cy - itemRect.bottom + 1;
+            score = score * 1000 + abs((itemRect.top + itemRect.bottom) / 2 - cy);
+            if (score < bestScore)
+            {
+                bestScore = score;
+                best = h;
+                bestRect = itemRect;
+                if (score == 0)
+                    break;
+            }
+        }
+        h = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM, TVGN_NEXTVISIBLE, (LPARAM)h);
+    }
+
+    if (!best)
+        return nullptr;
+
+    if (itemRectOut)
+        *itemRectOut = bestRect;
+    if (depth1Out)
+        *depth1Out = IsDepth1Item(hTree, best);
+    if (textOut && textOutLen > 0)
+        GetItemText(hTree, best, textOut, textOutLen);
+    return best;
+}
+
+static bool ItemCanLegitimatelyShowChevron(HWND hTree, TreeState *ts, HTREEITEM hItem)
+{
+    if (!hTree || !hItem)
+        return false;
+
+    if (ts)
+    {
+        int navId = GetTrackedNavItemId(*ts, hItem);
+        if (navId >= 0 && IsInsertableItem(navId))
+            return g_settings.items[navId].expandable;
+    }
+    return false;
+}
+
+static bool ShouldLogChevronTrace(HWND hTree, int partId)
+{
+    if (!g_inTreePaint || !hTree)
+        return false;
+
+    if (partId == TVP_HOTGLYPH)
+        return true;
+
+    if (g_lastSelectionTrace.hTree != hTree)
+        return false;
+
+    ULONGLONG age = GetTickCount64() - g_lastSelectionTrace.tick;
+    return age <= 750;
+}
+
+static void LogChevronTrace(HWND hTree, int partId, int stateId, const RECT& glyphRect)
+{
+    if (!ShouldLogChevronTrace(hTree, partId))
+        return;
+
+    RECT itemRect = {};
+    bool depth1 = false;
+    WCHAR itemText[64] = {};
+    HTREEITEM hItem = FindVisibleItemForGlyphRect(hTree, glyphRect, &itemRect,
+                                                  &depth1, itemText,
+                                                  ARRAYSIZE(itemText));
+    ULONGLONG now = GetTickCount64();
+    if (g_lastChevronTrace.hTree == hTree &&
+        g_lastChevronTrace.hItem == hItem &&
+        g_lastChevronTrace.partId == partId &&
+        g_lastChevronTrace.stateId == stateId &&
+        g_lastChevronTrace.glyphRect.left == glyphRect.left &&
+        g_lastChevronTrace.glyphRect.top == glyphRect.top &&
+        g_lastChevronTrace.glyphRect.right == glyphRect.right &&
+        g_lastChevronTrace.glyphRect.bottom == glyphRect.bottom &&
+        now - g_lastChevronTrace.tick <= 100)
+    {
+        return;
+    }
+
+    g_lastChevronTrace = {};
+    g_lastChevronTrace.hTree = hTree;
+    g_lastChevronTrace.hItem = hItem;
+    g_lastChevronTrace.partId = partId;
+    g_lastChevronTrace.stateId = stateId;
+    g_lastChevronTrace.glyphRect = glyphRect;
+    g_lastChevronTrace.tick = now;
+
+    bool recentSel = g_lastSelectionTrace.hTree == hTree;
+    ULONGLONG selAge = recentSel ? now - g_lastSelectionTrace.tick : 0;
+
+    Wh_Log(L"[CHEVRON-TRACE] tree=%04X part=%s state=%s glyph=(%d,%d,%d,%d) "
+           L"item=%04X '%s' depth1=%d itemRc=(%d,%d,%d,%d) "
+           L"sel=%d age=%llu phase=%s selOld=%04X '%s' selNew=%04X '%s' action=%d intercept=%d",
+           PTR4(hTree), ChevronPartName(partId), ChevronStateName(partId, stateId),
+           glyphRect.left, glyphRect.top, glyphRect.right, glyphRect.bottom,
+           PTR4(hItem), itemText, (int)depth1,
+           itemRect.left, itemRect.top, itemRect.right, itemRect.bottom,
+           (int)recentSel, (unsigned long long)selAge,
+           recentSel ? (g_lastSelectionTrace.changing ? L"changing" : L"changed") : L"-",
+           recentSel ? PTR4(g_lastSelectionTrace.hOld) : 0, recentSel ? g_lastSelectionTrace.oldText : L"",
+           recentSel ? PTR4(g_lastSelectionTrace.hNew) : 0, recentSel ? g_lastSelectionTrace.newText : L"",
+           recentSel ? g_lastSelectionTrace.action : 0,
+           recentSel ? (int)g_lastSelectionTrace.intercepted : 0);
+}
+
+static bool ShouldSuppressGlyphPaint(HWND hTree, HTREEITEM hItem)
+{
+    if (!hTree || !hItem || !IsDepth1Item(hTree, hItem))
+        return false;
+
+    if (g_suppressedChevron.hTree != hTree || g_suppressedChevron.hItem != hItem)
+        return false;
+
+    TreeState* ts = GetTree(hTree);
+    if (ItemCanLegitimatelyShowChevron(hTree, ts, hItem))
+    {
+        g_suppressedChevron = {};
+        return false;
+    }
+
+    return true;
 }
 
 struct RedrawFreeze {
@@ -1616,17 +1839,25 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     return 0;
                 TreeState* ts = GetTree(hTree);
                 LPNMTREEVIEWW nm = (LPNMTREEVIEWW)lParam;
+                bool userDriven = nm->action == TVC_BYMOUSE || nm->action == TVC_BYKEYBOARD;
                 bool intercept =
-                    nm->action != TVC_BYMOUSE && nm->action != TVC_BYKEYBOARD &&
+                    !userDriven &&
                     nm->itemNew.hItem && IsDepth1Item(hTree, nm->itemNew.hItem);
                 if (ts)
                     LogDepth1SelectionEvent(hTree, *ts, L"changing", nm, intercept);
                 if (intercept)
                 {
+                    g_suppressedChevron = {};
+                    g_suppressedChevron.hTree = hTree;
+                    g_suppressedChevron.hItem = nm->itemNew.hItem;
+                    g_suppressedChevron.action = nm->action;
+                    g_suppressedChevron.tick = GetTickCount64();
                     Wh_Log(L"[SEL-BLOCK] tree=%04X item=%04X action=%d",
                            PTR4(hTree), PTR4(nm->itemNew.hItem), nm->action);
                     return TRUE;
                 }
+                if (userDriven && g_suppressedChevron.hTree == hTree)
+                    g_suppressedChevron = {};
             }
 
             if (hdr->code == TVN_SELCHANGEDW || hdr->code == TVN_SELCHANGEDA)
@@ -1635,11 +1866,14 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     return 0;
                 TreeState* ts = GetTree(hTree);
                 LPNMTREEVIEWW nm = (LPNMTREEVIEWW)lParam;
+                bool userDriven = nm->action == TVC_BYMOUSE || nm->action == TVC_BYKEYBOARD;
                 bool intercept =
-                    nm->action != TVC_BYMOUSE && nm->action != TVC_BYKEYBOARD &&
+                    !userDriven &&
                     nm->itemNew.hItem && IsDepth1Item(hTree, nm->itemNew.hItem);
                 if (ts)
                     LogDepth1SelectionEvent(hTree, *ts, L"changed", nm, intercept);
+                if (userDriven && g_suppressedChevron.hTree == hTree)
+                    g_suppressedChevron = {};
                 if (intercept)
                     return 0;
             }
@@ -2115,6 +2349,8 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
         g_inSubclassProc++;
         g_deferredOpInProgress = true;
         g_mutatingTree = hWnd;
+        if (g_suppressedChevron.hTree == hWnd)
+            g_suppressedChevron = {};
 
         TreeState* ts = GetTree(hWnd);
         ts = RunDeferredWork(hWnd, ts, WORK_FULL_REBUILD, FullRebuildTree);
@@ -2299,10 +2535,13 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
         g_lastSepY = -1;
         g_firstSepY = -1;
         g_inTreePaint = true;
+        HWND prevPaintTree = g_treePaintHwnd;
+        g_treePaintHwnd = hWnd;
 
         LRESULT result = SubClassTreeWndProc_orig(hWnd, uMsg, wParam, lParam, uIdSubclass, dwRefData);
 
         g_inTreePaint = false;
+        g_treePaintHwnd = prevPaintTree;
 
         ts = GetTree(hWnd);
         if (g_lastSepY >= 0 && g_sepColor != CLR_INVALID && ts && ts->sepRetries < 3)
@@ -2384,20 +2623,26 @@ using DrawThemeBackground_t = HRESULT (WINAPI *)(HTHEME, HDC, int, int, LPCRECT,
 
 DrawThemeBackground_t DrawThemeBackground_orig;
 
-static thread_local bool g_chevronLogged = false;
-
 HRESULT WINAPI DrawThemeBackground_hook(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, LPCRECT pRect, LPCRECT pClipRect)
 {
     if (IsUnloading())
         return DrawThemeBackground_orig(hTheme, hdc, iPartId, iStateId, pRect, pClipRect);
 
-    if (iPartId == TVP_GLYPH || iPartId == TVP_HOTGLYPH)
+    if ((iPartId == TVP_GLYPH || iPartId == TVP_HOTGLYPH) &&
+        pRect && g_inTreePaint && g_treePaintHwnd)
     {
-        if (!g_chevronLogged && g_inTreePaint)
+        LogChevronTrace(g_treePaintHwnd, iPartId, iStateId, *pRect);
+        WCHAR itemText[64] = {};
+        HTREEITEM hItem = FindVisibleItemForGlyphRect(g_treePaintHwnd, *pRect, nullptr,
+                                                      nullptr, itemText,
+                                                      ARRAYSIZE(itemText));
+        if (ShouldSuppressGlyphPaint(g_treePaintHwnd, hItem))
         {
-            g_chevronLogged = true;
-            Wh_Log(L"[CHEVRON] DTB hook active, fixEnabled=%d",
-                (int)g_settings.fixChevronDrawing);
+            Wh_Log(L"[CHEVRON-SUPPRESS] tree=%04X part=%s state=%s item=%04X '%s' action=%d age=%llu",
+                   PTR4(g_treePaintHwnd), ChevronPartName(iPartId), ChevronStateName(iPartId, iStateId),
+                   PTR4(hItem), itemText, g_suppressedChevron.action,
+                   (unsigned long long)(GetTickCount64() - g_suppressedChevron.tick));
+            return S_OK;
         }
         if (g_inTreePaint && g_settings.fixChevronDrawing)
         {
