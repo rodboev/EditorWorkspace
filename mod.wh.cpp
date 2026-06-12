@@ -2,7 +2,7 @@
 // @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's nav
-// @version         1.3.6
+// @version         1.3.9
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         *
@@ -204,7 +204,25 @@ static bool g_logSepDraw = true;
 
 static void ResetSepColor() {
     g_sepColor = CLR_INVALID;
+    g_sepColorPendingVerify = false;
     g_logSepDraw = true;
+}
+
+static COLORREF GetTreeBgColor(HWND hTree)
+{
+    COLORREF bg = (COLORREF)SendMessageW(hTree, TVM_GETBKCOLOR, 0, 0);
+    if (bg == CLR_INVALID || (int)bg == -1)
+        bg = GetSysColor(COLOR_WINDOW);
+    return bg;
+}
+
+static COLORREF DeriveSepColor(HWND hTree)
+{
+    COLORREF bg = GetTreeBgColor(hTree);
+    int sum = GetRValue(bg) + GetGValue(bg) + GetBValue(bg);
+    int d = (sum < 384) ? 56 : -41;
+    auto cl = [](int v) { return (BYTE)(v < 0 ? 0 : (v > 255 ? 255 : v)); };
+    return RGB(cl(GetRValue(bg) + d), cl(GetGValue(bg) + d), cl(GetBValue(bg) + d));
 }
 
 enum PendingWork : uint8_t {
@@ -236,6 +254,7 @@ struct TreeState {
     bool triedHomeSpacer = false;
     HIMAGELIST savedStateImageList = nullptr;
     std::unordered_set<HTREEITEM> allowedGlyphItems;
+    std::unordered_set<HTREEITEM> blockedGlyphItems;
 };
 static std::unordered_map<HWND, TreeState> g_trees;
 static std::recursive_mutex g_treesMutex;
@@ -338,6 +357,7 @@ static void ResetTreeCleanup(TreeState& ts)
     ts.triedHomeSpacer = false;
     ts.pendingWork = WORK_QA_CLEANUP | WORK_HG_CLEANUP | WORK_DUP_COLLAPSE;
     ts.allowedGlyphItems.clear();
+    ts.blockedGlyphItems.clear();
 }
 
 // Globals bridging AppendRoot_hook to TVM_INSERTITEM handler.
@@ -1010,7 +1030,8 @@ static void CaptureUserSelectionHint(HWND hTree, LPARAM lParam)
     TVHITTESTINFO ht = {};
     ht.pt = pt;
     HTREEITEM hHit = (HTREEITEM)SendMessageW(hTree, TVM_HITTEST, 0, (LPARAM)&ht);
-    if (!hHit || !IsDepth1Item(hTree, hHit) || !(ht.flags & TVHT_ONITEM))
+    UINT activatingFlags = TVHT_ONITEMLABEL | TVHT_ONITEMICON;
+    if (!hHit || !IsDepth1Item(hTree, hHit) || !(ht.flags & activatingFlags))
         return;
 
     g_userSelectionHint = {};
@@ -1044,7 +1065,23 @@ static void RememberAllowedGlyphItem(HWND hTree, HTREEITEM hItem)
         return;
 
     if (!ItemCanLegitimatelyShowChevron(hTree, ts, hItem))
+    {
         ts->allowedGlyphItems.insert(hItem);
+        ts->blockedGlyphItems.erase(hItem);
+    }
+}
+
+static void RememberBlockedGlyphItem(HWND hTree, HTREEITEM hItem)
+{
+    if (!hTree || !hItem || !IsDepth1Item(hTree, hItem))
+        return;
+
+    TreeState* ts = GetTree(hTree);
+    if (!ts || ItemCanLegitimatelyShowChevron(hTree, ts, hItem))
+        return;
+
+    if (!ts->allowedGlyphItems.count(hItem))
+        ts->blockedGlyphItems.insert(hItem);
 }
 
 static bool ShouldLogChevronTrace(HWND hTree, int partId)
@@ -1113,9 +1150,9 @@ static void LogChevronTrace(HWND hTree, int partId, int stateId, const RECT& gly
            recentSel ? (int)g_lastSelectionTrace.intercepted : 0);
 }
 
-static bool ShouldSuppressGlyphPaint(HWND hTree, HTREEITEM hItem)
+static bool ShouldSuppressGlyphPaint(HWND hTree, HTREEITEM hItem, int partId)
 {
-    if (!IsSuppressionWindowActive(hTree) || !hItem || !IsDepth1Item(hTree, hItem))
+    if (!hItem || !IsDepth1Item(hTree, hItem))
         return false;
 
     TreeState* ts = GetTree(hTree);
@@ -1125,7 +1162,13 @@ static bool ShouldSuppressGlyphPaint(HWND hTree, HTREEITEM hItem)
     if (ts && ts->allowedGlyphItems.count(hItem))
         return false;
 
-    return true;
+    if (partId == TVP_HOTGLYPH)
+        return true;
+
+    if (IsSuppressionWindowActive(hTree))
+        return true;
+
+    return ts && ts->blockedGlyphItems.count(hItem);
 }
 
 struct RedrawFreeze {
@@ -1793,7 +1836,6 @@ static void RedrawSeps(HWND hTree, HDC hdc, TreeState& ts)
             foundBoundary = true;
     }
 
-    // Walk log tags: O=ours, H=home, G=gallery, P=spacer, B/b=boundary, Q=belowQA, S=sep, .=other
     WCHAR walkLog[64] = {};
     int walkIdx = 0;
 
@@ -1856,14 +1898,9 @@ static void RedrawSeps(HWND hTree, HDC hdc, TreeState& ts)
                 }
                 else if (foundBoundary && isTall && !foundBelowQA)
                 {
-                    if (!g_settings.removeSepBelowQA)
-                    {
-                        drawSep = true;
-                        sepY = rc.top + baseHeight / 2;
-                        tag = L'S';
-                    }
-                    else
-                        tag = L'Q';
+                    drawSep = true;
+                    sepY = rc.top + baseHeight / 2;
+                    tag = L'S';
                 }
 
                 if (drawSep)
@@ -1882,7 +1919,9 @@ static void RedrawSeps(HWND hTree, HDC hdc, TreeState& ts)
     walkLog[walkIdx] = 0;
     if (g_logSepDraw)
     {
-        Wh_Log(L"[SEP-DRAW] tree=%04X walk=[%s] drew=%d hHome=%04X hGallery=%04X", PTR4(hTree), walkLog, sepCount, PTR4(ts.hItems[NAV_HOME]), PTR4(ts.hItems[NAV_GALLERY]));
+        Wh_Log(L"[SEP-DRAW] tree=%04X walk=[%s] drew=%d hHome=%04X hGallery=%04X",
+               PTR4(hTree), walkLog, sepCount,
+               PTR4(ts.hItems[NAV_HOME]), PTR4(ts.hItems[NAV_GALLERY]));
     }
 }
 
@@ -1958,8 +1997,7 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                     if (!ShouldDrawManagedSeparators())
                         return CDRF_NOTIFYPOSTPAINT;
 
-                    if (ts && HasOurItemsInTree(*ts) &&
-                        g_sepColor != CLR_INVALID && !g_sepColorPendingVerify)
+                    if (ts && HasOurItemsInTree(*ts))
                         return CDRF_NOTIFYPOSTPAINT;
                     LRESULT r = DefSubclassProc(hWnd, uMsg, wParam, lParam);
                     return r | CDRF_NOTIFYPOSTPAINT;
@@ -1967,30 +2005,14 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
 
                 if (stage == CDDS_POSTPAINT)
                 {
-                    if (g_sepColorPendingVerify && g_sepColor != CLR_INVALID && g_settings.hasItemsAtTop)
-                    {
-                        g_sepColorPendingVerify = false;
-                        COLORREF c = SampleSeparatorColor(hTree, cd->nmcd.hdc);
-                        if (c != CLR_INVALID && c != g_sepColor)
-                        {
-                            Wh_Log(L"[SEP] color changed 0x%06X -> 0x%06X tree=%04X",
-                                   g_sepColor, c, PTR4(hTree));
-                            g_sepColor = c;
-                            g_logSepDraw = true;
-                        }
-                        InvalidateRect(hTree, nullptr, TRUE);
-                    }
-
                     if (g_sepColor == CLR_INVALID && g_settings.hasItemsAtTop)
                     {
                         COLORREF c = SampleSeparatorColor(hTree, cd->nmcd.hdc);
-                        if (c != CLR_INVALID)
-                        {
-                            g_sepColor = c;
-                            g_logSepDraw = true;
-                            Wh_Log(L"[SEP] 0x%06X tree=%04X", c, PTR4(hTree));
-                            InvalidateRect(hTree, nullptr, TRUE);
-                        }
+                        if (c == CLR_INVALID)
+                            c = DeriveSepColor(hTree);
+                        g_sepColor = c;
+                        g_logSepDraw = true;
+                        Wh_Log(L"[SEP] 0x%06X tree=%04X", c, PTR4(hTree));
                     }
 
                     HDC hdc = cd->nmcd.hdc;
@@ -2009,24 +2031,21 @@ static LRESULT CALLBACK SepParentSubclassProc(HWND hWnd, UINT uMsg, WPARAM wPara
                         if (GetItemRect(hTree, hHidden, &rcHide))
                         {
                             HDC hdc = cd->nmcd.hdc;
-                            COLORREF bg = GetPixel(hdc, 1, rcHide.top + 2);
-                            if (bg == CLR_INVALID)
-                                bg = GetSysColor(COLOR_WINDOW);
+                            COLORREF bg = GetTreeBgColor(hTree);
                             HBRUSH bgBrush = CreateSolidBrush(bg);
                             if (bgBrush)
                             {
                                 FillRect(hdc, &rcHide, bgBrush);
                                 DeleteObject(bgBrush);
                             }
-                            if (g_sepColor != CLR_INVALID)
+                            if (g_sepColor != CLR_INVALID && !g_settings.removeSepBelowNav)
                             {
-                                bool drawSep = !g_settings.removeSepBelowNav &&
-                                               (hHidden == ts->homeSpacerItem);
+                                bool drawSep = (hHidden == ts->homeSpacerItem);
                                 if (!drawSep)
                                 {
-                                    HTREEITEM hPrev = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM, TVGN_PREVIOUS, (LPARAM)hHidden);
-                                    drawSep = !g_settings.removeSepBelowNav &&
-                                              hPrev && IsOurSection(*ts, hPrev);
+                                    HTREEITEM hPrev = (HTREEITEM)SendMessageW(
+                                        hTree, TVM_GETNEXTITEM, TVGN_PREVIOUS, (LPARAM)hHidden);
+                                    drawSep = hPrev && IsOurSection(*ts, hPrev);
                                 }
                                 if (drawSep)
                                 {
@@ -2709,10 +2728,13 @@ HRESULT WINAPI DrawThemeBackground_hook(HTHEME hTheme, HDC hdc, int iPartId, int
         HTREEITEM hItem = FindVisibleItemForGlyphRect(g_treePaintHwnd, *pRect, nullptr,
                                                       nullptr, itemText,
                                                       ARRAYSIZE(itemText));
-        if (!IsSuppressionWindowActive(g_treePaintHwnd))
+        bool suppressionWindowActive = IsSuppressionWindowActive(g_treePaintHwnd);
+        if (!suppressionWindowActive && iPartId == TVP_GLYPH)
             RememberAllowedGlyphItem(g_treePaintHwnd, hItem);
-        if (ShouldSuppressGlyphPaint(g_treePaintHwnd, hItem))
+        if (ShouldSuppressGlyphPaint(g_treePaintHwnd, hItem, iPartId))
         {
+            if (suppressionWindowActive && iPartId == TVP_GLYPH)
+                RememberBlockedGlyphItem(g_treePaintHwnd, hItem);
             Wh_Log(L"[CHEVRON-SUPPRESS] tree=%04X part=%s state=%s item=%04X '%s' action=%d age=%llu",
                    PTR4(g_treePaintHwnd), ChevronPartName(iPartId), ChevronStateName(iPartId, iStateId),
                    PTR4(hItem), itemText, g_suppressedChevron.action,
