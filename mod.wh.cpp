@@ -2,7 +2,7 @@
 // @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's nav
-// @version         1.3.20
+// @version         1.3.27
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         *
@@ -770,6 +770,16 @@ struct RawChevronSuppressionState {
 };
 static thread_local RawChevronSuppressionState g_rawChevronSuppression;
 
+struct CompositeTraceState {
+    int kind = 0;
+    HWND hDstTree = nullptr;
+    HWND hSrcTree = nullptr;
+    RECT dstRect = {};
+    RECT srcRect = {};
+    ULONGLONG tick = 0;
+};
+static thread_local CompositeTraceState g_lastCompositeTrace;
+
 struct SuppressedChevronState {
     HWND hTree = nullptr;
     HTREEITEM hItem = nullptr;
@@ -1481,6 +1491,152 @@ static bool ShouldSuppressUnresolvedChevron(HDC hdc, int partId, int stateId, co
     else if (topStripFallback)
         InvalidateTrackedTrees();
     return true;
+}
+
+enum CompositeTraceKind {
+    COMP_TRACE_ALPHABLEND = 1,
+    COMP_TRACE_BITBLT = 2,
+    COMP_TRACE_IMAGELIST = 3,
+};
+
+static bool HasRecentChevronCompositeInterest()
+{
+    ULONGLONG now = GetTickCount64();
+    if (g_lastChevronTrace.tick && now - g_lastChevronTrace.tick <= 500)
+        return true;
+    if (g_rawChevronSuppression.active && now - g_rawChevronSuppression.tick <= 500)
+        return true;
+    return false;
+}
+
+static bool IsLikelyChevronCompositeRect(const RECT& dstRect)
+{
+    int width = dstRect.right - dstRect.left;
+    int height = dstRect.bottom - dstRect.top;
+    if (width <= 0 || height <= 0)
+        return false;
+
+    if (height >= 24 && height <= 96)
+        return true;
+
+    return width <= 64 && height <= 96;
+}
+
+static bool HasRecentTopStripRawSuppression(ULONGLONG *ageOut = nullptr)
+{
+    if (!g_rawChevronSuppression.active || !g_rawChevronSuppression.tick)
+        return false;
+
+    ULONGLONG age = GetTickCount64() - g_rawChevronSuppression.tick;
+    if (ageOut)
+        *ageOut = age;
+
+    if (age > 250)
+        return false;
+
+    return g_rawChevronSuppression.glyphRect.top == 0 &&
+           g_rawChevronSuppression.glyphRect.bottom > 0 &&
+           g_rawChevronSuppression.glyphRect.bottom <= 16;
+}
+
+static bool ShouldSuppressChevronBitBlt(HWND hDstTree, const RECT& dstRect, DWORD rop)
+{
+    ULONGLONG rawAge = 0;
+    if (!HasRecentTopStripRawSuppression(&rawAge))
+        return false;
+
+    if (!hDstTree)
+        return false;
+
+    if (rop != SRCCOPY)
+        return false;
+
+    int dstWidth = dstRect.right - dstRect.left;
+    int dstHeight = dstRect.bottom - dstRect.top;
+    if (dstWidth <= 0 || dstHeight <= 0)
+        return false;
+
+    bool rowBand =
+        dstRect.left == 0 &&
+        dstWidth >= 200 &&
+        dstHeight >= 48 &&
+        dstHeight <= 96;
+
+    return rowBand;
+}
+
+static bool ShouldSuppressDiagnosticCompositeWindow()
+{
+    return HasRecentTopStripRawSuppression();
+}
+
+static void LogCompositeTrace(int kind, HDC hdcDst, const RECT& dstRect,
+                              HDC hdcSrc, const RECT *srcRect)
+{
+    HWND hDstTree = ResolveKnownTreeFromHdc(hdcDst);
+    HWND hSrcTree = ResolveKnownTreeFromHdc(hdcSrc);
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG rawAge = g_rawChevronSuppression.tick ? (now - g_rawChevronSuppression.tick)
+                                                    : ~0ull;
+
+    if (kind == COMP_TRACE_BITBLT)
+    {
+        if (!hDstTree || rawAge > 250 || !IsLikelyChevronCompositeRect(dstRect))
+            return;
+    }
+    else if (!hDstTree && !hSrcTree && !HasRecentChevronCompositeInterest())
+    {
+        return;
+    }
+
+    RECT src = srcRect ? *srcRect : RECT{};
+    if (g_lastCompositeTrace.kind == kind &&
+        g_lastCompositeTrace.hDstTree == hDstTree &&
+        g_lastCompositeTrace.hSrcTree == hSrcTree &&
+        g_lastCompositeTrace.dstRect.left == dstRect.left &&
+        g_lastCompositeTrace.dstRect.top == dstRect.top &&
+        g_lastCompositeTrace.dstRect.right == dstRect.right &&
+        g_lastCompositeTrace.dstRect.bottom == dstRect.bottom &&
+        g_lastCompositeTrace.srcRect.left == src.left &&
+        g_lastCompositeTrace.srcRect.top == src.top &&
+        g_lastCompositeTrace.srcRect.right == src.right &&
+        g_lastCompositeTrace.srcRect.bottom == src.bottom &&
+        now - g_lastCompositeTrace.tick <= 100)
+    {
+        return;
+    }
+
+    g_lastCompositeTrace = {};
+    g_lastCompositeTrace.kind = kind;
+    g_lastCompositeTrace.hDstTree = hDstTree;
+    g_lastCompositeTrace.hSrcTree = hSrcTree;
+    g_lastCompositeTrace.dstRect = dstRect;
+    g_lastCompositeTrace.srcRect = src;
+    g_lastCompositeTrace.tick = now;
+
+    const WCHAR *kindName = L"?";
+    if (kind == COMP_TRACE_ALPHABLEND)
+        kindName = L"AlphaBlend";
+    else if (kind == COMP_TRACE_BITBLT)
+        kindName = L"BitBlt";
+    else if (kind == COMP_TRACE_IMAGELIST)
+        kindName = L"ImageList_DrawIndirect";
+
+    HWND hDstWnd = hdcDst ? WindowFromDC(hdcDst) : nullptr;
+    HWND hSrcWnd = hdcSrc ? WindowFromDC(hdcSrc) : nullptr;
+    WCHAR dstCls[64] = {};
+    WCHAR srcCls[64] = {};
+    if (hDstWnd)
+        GetClassNameW(hDstWnd, dstCls, ARRAYSIZE(dstCls));
+    if (hSrcWnd)
+        GetClassNameW(hSrcWnd, srcCls, ARRAYSIZE(srcCls));
+
+    Wh_Log(L"[CHEVRON-COMPOSITE] kind=%s dstTree=%04X dstWnd=%04X dstCls='%s' dst=(%d,%d,%d,%d) srcTree=%04X srcWnd=%04X srcCls='%s' src=(%d,%d,%d,%d) rawAge=%llu",
+           kindName, PTR4(hDstTree), PTR4(hDstWnd), dstCls,
+           dstRect.left, dstRect.top, dstRect.right, dstRect.bottom,
+           PTR4(hSrcTree), PTR4(hSrcWnd), srcCls,
+           src.left, src.top, src.right, src.bottom,
+           (unsigned long long)rawAge);
 }
 
 struct RedrawFreeze {
@@ -3025,9 +3181,15 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
 
 using DrawThemeBackground_t = HRESULT (WINAPI *)(HTHEME, HDC, int, int, LPCRECT, LPCRECT);
 using DrawThemeBackgroundEx_t = HRESULT (WINAPI *)(HTHEME, HDC, int, int, LPCRECT, const DTBGOPTS *);
+using GdiAlphaBlend_t = BOOL (WINAPI *)(HDC, int, int, int, int, HDC, int, int, int, int, BLENDFUNCTION);
+using BitBlt_t = BOOL (WINAPI *)(HDC, int, int, int, int, HDC, int, int, DWORD);
+using ImageList_DrawIndirect_t = BOOL (WINAPI *)(IMAGELISTDRAWPARAMS *);
 
 DrawThemeBackground_t DrawThemeBackground_orig;
 DrawThemeBackgroundEx_t DrawThemeBackgroundEx_orig;
+GdiAlphaBlend_t GdiAlphaBlend_orig;
+BitBlt_t BitBlt_orig;
+ImageList_DrawIndirect_t ImageList_DrawIndirect_orig;
 
 static bool HandleChevronThemeDraw(HDC hdc, int iPartId, int iStateId, LPCRECT pRect)
 {
@@ -3095,6 +3257,59 @@ HRESULT WINAPI DrawThemeBackgroundEx_hook(HTHEME hTheme, HDC hdc, int iPartId, i
         return S_OK;
 
     return DrawThemeBackgroundEx_orig(hTheme, hdc, iPartId, iStateId, pRect, pOptions);
+}
+
+BOOL WINAPI GdiAlphaBlend_hook(HDC hdcDst, int xoriginDest, int yoriginDest,
+                               int wDest, int hDest, HDC hdcSrc,
+                               int xoriginSrc, int yoriginSrc, int wSrc, int hSrc,
+                               BLENDFUNCTION ftn)
+{
+    RECT dstRect = { xoriginDest, yoriginDest, xoriginDest + wDest, yoriginDest + hDest };
+    RECT srcRect = { xoriginSrc, yoriginSrc, xoriginSrc + wSrc, yoriginSrc + hSrc };
+    LogCompositeTrace(COMP_TRACE_ALPHABLEND, hdcDst, dstRect, hdcSrc, &srcRect);
+    return GdiAlphaBlend_orig(hdcDst, xoriginDest, yoriginDest, wDest, hDest,
+                              hdcSrc, xoriginSrc, yoriginSrc, wSrc, hSrc, ftn);
+}
+
+BOOL WINAPI BitBlt_hook(HDC hdcDst, int x, int y, int cx, int cy,
+                        HDC hdcSrc, int x1, int y1, DWORD rop)
+{
+    RECT dstRect = { x, y, x + cx, y + cy };
+    RECT srcRect = { x1, y1, x1 + cx, y1 + cy };
+    LogCompositeTrace(COMP_TRACE_BITBLT, hdcDst, dstRect, hdcSrc, &srcRect);
+    HWND hDstTree = ResolveKnownTreeFromHdc(hdcDst);
+    if (ShouldSuppressChevronBitBlt(hDstTree, dstRect, rop))
+    {
+        ULONGLONG rawAge = GetTickCount64() - g_rawChevronSuppression.tick;
+        Wh_Log(L"[CHEVRON-BITBLT-SUPPRESS] tree=%04X dst=(%d,%d,%d,%d) src=(%d,%d,%d,%d) rawAge=%llu",
+               PTR4(hDstTree), dstRect.left, dstRect.top, dstRect.right, dstRect.bottom,
+               srcRect.left, srcRect.top, srcRect.right, srcRect.bottom,
+               (unsigned long long)rawAge);
+        InvalidateRect(hDstTree, &dstRect, TRUE);
+        return TRUE;
+    }
+    return BitBlt_orig(hdcDst, x, y, cx, cy, hdcSrc, x1, y1, rop);
+}
+
+BOOL WINAPI ImageList_DrawIndirect_hook(IMAGELISTDRAWPARAMS *pimldp)
+{
+    if (pimldp)
+    {
+        RECT dstRect = { pimldp->x, pimldp->y, pimldp->x + pimldp->cx, pimldp->y + pimldp->cy };
+        RECT srcRect = { pimldp->xBitmap, pimldp->yBitmap,
+                         pimldp->xBitmap + pimldp->cx, pimldp->yBitmap + pimldp->cy };
+        LogCompositeTrace(COMP_TRACE_IMAGELIST, pimldp->hdcDst, dstRect, nullptr, &srcRect);
+        if (ShouldSuppressDiagnosticCompositeWindow())
+        {
+            ULONGLONG rawAge = GetTickCount64() - g_rawChevronSuppression.tick;
+            Wh_Log(L"[CHEVRON-DIAG-SUPPRESS] kind=ImageList_DrawIndirect dst=(%d,%d,%d,%d) src=(%d,%d,%d,%d) rawAge=%llu",
+                   dstRect.left, dstRect.top, dstRect.right, dstRect.bottom,
+                   srcRect.left, srcRect.top, srcRect.right, srcRect.bottom,
+                   (unsigned long long)rawAge);
+            return TRUE;
+        }
+    }
+    return ImageList_DrawIndirect_orig(pimldp);
 }
 
 // --- Settings ---
@@ -3282,6 +3497,36 @@ static bool InitializeModCore(HMODULE hExplorerFrame)
     }
     else
         Wh_Log(L"[CHEVRON] uxtheme.dll not loaded");
+
+    HMODULE hGdi32 = GetModuleHandleW(L"gdi32.dll");
+    if (hGdi32)
+    {
+        auto pGdiAlphaBlend = (GdiAlphaBlend_t)GetProcAddress(hGdi32, "GdiAlphaBlend");
+        if (pGdiAlphaBlend)
+            WindhawkUtils::SetFunctionHook(pGdiAlphaBlend, GdiAlphaBlend_hook, &GdiAlphaBlend_orig);
+        else
+            Wh_Log(L"[CHEVRON] GetProcAddress(GdiAlphaBlend) failed");
+
+        auto pBitBlt = (BitBlt_t)GetProcAddress(hGdi32, "BitBlt");
+        if (pBitBlt)
+            WindhawkUtils::SetFunctionHook(pBitBlt, BitBlt_hook, &BitBlt_orig);
+        else
+            Wh_Log(L"[CHEVRON] GetProcAddress(BitBlt) failed");
+    }
+    else
+        Wh_Log(L"[CHEVRON] gdi32.dll not loaded");
+
+    HMODULE hComctl32 = GetModuleHandleW(L"comctl32.dll");
+    if (hComctl32)
+    {
+        auto pImageListDrawIndirect = (ImageList_DrawIndirect_t)GetProcAddress(hComctl32, "ImageList_DrawIndirect");
+        if (pImageListDrawIndirect)
+            WindhawkUtils::SetFunctionHook(pImageListDrawIndirect, ImageList_DrawIndirect_hook, &ImageList_DrawIndirect_orig);
+        else
+            Wh_Log(L"[CHEVRON] GetProcAddress(ImageList_DrawIndirect) failed");
+    }
+    else
+        Wh_Log(L"[CHEVRON] comctl32.dll not loaded");
 
     return true;
 }
