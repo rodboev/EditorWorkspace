@@ -2,7 +2,7 @@
 // @id              add-virtual-folders-to-nav-top
 // @name            Add This PC and Desktop to Nav Top
 // @description     Adds This PC and Desktop to the top of Explorer's nav
-// @version         1.3.9
+// @version         1.3.20
 // @author          Rod Boev
 // @github          https://github.com/rodboev
 // @include         *
@@ -263,6 +263,27 @@ static TreeState* GetTree(HWND hWnd) {
     std::lock_guard<std::recursive_mutex> lock(g_treesMutex);
     auto it = g_trees.find(hWnd);
     return (it != g_trees.end()) ? &it->second : nullptr;
+}
+
+static HWND ResolveKnownTreeFromHdc(HDC hdc)
+{
+    if (!hdc)
+        return nullptr;
+
+    HWND hWnd = WindowFromDC(hdc);
+    while (hWnd)
+    {
+        if (GetTree(hWnd))
+            return hWnd;
+        hWnd = GetParent(hWnd);
+    }
+
+    return nullptr;
+}
+
+static HWND ResolveWindowFromHdc(HDC hdc)
+{
+    return hdc ? WindowFromDC(hdc) : nullptr;
 }
 
 static bool IsNavPaneHost(HWND hTree)
@@ -742,6 +763,13 @@ struct ChevronTraceState {
 };
 static thread_local ChevronTraceState g_lastChevronTrace;
 
+struct RawChevronSuppressionState {
+    RECT glyphRect = {};
+    ULONGLONG tick = 0;
+    bool active = false;
+};
+static thread_local RawChevronSuppressionState g_rawChevronSuppression;
+
 struct SuppressedChevronState {
     HWND hTree = nullptr;
     HTREEITEM hItem = nullptr;
@@ -1086,11 +1114,11 @@ static void RememberBlockedGlyphItem(HWND hTree, HTREEITEM hItem)
 
 static bool ShouldLogChevronTrace(HWND hTree, int partId)
 {
-    if (!g_inTreePaint || !hTree)
-        return false;
-
     if (partId == TVP_HOTGLYPH)
         return true;
+
+    if (!hTree)
+        return false;
 
     if (g_lastSelectionTrace.hTree != hTree)
         return false;
@@ -1150,6 +1178,223 @@ static void LogChevronTrace(HWND hTree, int partId, int stateId, const RECT& gly
            recentSel ? (int)g_lastSelectionTrace.intercepted : 0);
 }
 
+static void LogChevronTraceUnresolved(HDC hdc, int partId, int stateId, const RECT& glyphRect)
+{
+    if (!ShouldLogChevronTrace(nullptr, partId))
+        return;
+
+    ULONGLONG now = GetTickCount64();
+    if (g_lastChevronTrace.hTree == nullptr &&
+        g_lastChevronTrace.partId == partId &&
+        g_lastChevronTrace.stateId == stateId &&
+        g_lastChevronTrace.glyphRect.left == glyphRect.left &&
+        g_lastChevronTrace.glyphRect.top == glyphRect.top &&
+        g_lastChevronTrace.glyphRect.right == glyphRect.right &&
+        g_lastChevronTrace.glyphRect.bottom == glyphRect.bottom &&
+        now - g_lastChevronTrace.tick <= 100)
+    {
+        return;
+    }
+
+    HWND hWnd = ResolveWindowFromHdc(hdc);
+    WCHAR cls[64] = {};
+    if (hWnd)
+        GetClassNameW(hWnd, cls, ARRAYSIZE(cls));
+
+    g_lastChevronTrace = {};
+    g_lastChevronTrace.partId = partId;
+    g_lastChevronTrace.stateId = stateId;
+    g_lastChevronTrace.glyphRect = glyphRect;
+    g_lastChevronTrace.tick = now;
+
+    Wh_Log(L"[CHEVRON-TRACE-RAW] hwnd=%04X class='%s' part=%s state=%s glyph=(%d,%d,%d,%d)",
+           PTR4(hWnd), cls, ChevronPartName(partId), ChevronStateName(partId, stateId),
+           glyphRect.left, glyphRect.top, glyphRect.right, glyphRect.bottom);
+}
+
+static void EraseGlyphRect(HDC hdc, const RECT& glyphRect)
+{
+    if (!hdc)
+        return;
+
+    int sampleY = (glyphRect.top + glyphRect.bottom) / 2;
+    int sampleX = glyphRect.left > 1 ? glyphRect.left - 2 : glyphRect.right + 1;
+    COLORREF bg = GetPixel(hdc, sampleX, sampleY);
+    if (bg == CLR_INVALID)
+    {
+        sampleX = glyphRect.right + 2;
+        bg = GetPixel(hdc, sampleX, sampleY);
+    }
+    if (bg == CLR_INVALID)
+        bg = GetSysColor(COLOR_WINDOW);
+
+    HBRUSH brush = CreateSolidBrush(bg);
+    if (!brush)
+        return;
+
+    FillRect(hdc, &glyphRect, brush);
+    DeleteObject(brush);
+}
+
+static bool ResolveTrackedGlyphTarget(const RECT& glyphRect, HWND *hTreeOut,
+                                      HTREEITEM *hItemOut, RECT *itemRectOut)
+{
+    int cx = (glyphRect.left + glyphRect.right) / 2;
+    int cy = (glyphRect.top + glyphRect.bottom) / 2;
+
+    std::vector<HWND> treeList;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_treesMutex);
+        treeList.reserve(g_trees.size());
+        for (auto& [hTree, ts] : g_trees)
+            treeList.push_back(hTree);
+    }
+
+    for (HWND hTree : treeList)
+    {
+        if (!IsWindow(hTree) || !IsWindowVisible(hTree))
+            continue;
+
+        RECT clientRect = {};
+        if (!GetClientRect(hTree, &clientRect))
+            continue;
+
+        if (cx < clientRect.left || cx >= clientRect.right ||
+            cy < clientRect.top || cy >= clientRect.bottom)
+        {
+            continue;
+        }
+
+        RECT itemRect = {};
+        bool depth1 = false;
+        HTREEITEM hItem = FindVisibleItemForGlyphRect(hTree, glyphRect, &itemRect,
+                                                      &depth1, nullptr, 0);
+        if (!hItem || !depth1 || cy < itemRect.top || cy >= itemRect.bottom)
+            continue;
+
+        if (hTreeOut)
+            *hTreeOut = hTree;
+        if (hItemOut)
+            *hItemOut = hItem;
+        if (itemRectOut)
+            *itemRectOut = itemRect;
+        return true;
+    }
+
+    return false;
+}
+
+static bool ResolveTrackedCursorTarget(HWND *hTreeOut, HTREEITEM *hItemOut,
+                                       RECT *itemRectOut)
+{
+    POINT ptScreen = {};
+    if (!GetCursorPos(&ptScreen))
+        return false;
+
+    std::vector<HWND> treeList;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_treesMutex);
+        treeList.reserve(g_trees.size());
+        for (auto& [hTree, ts] : g_trees)
+            treeList.push_back(hTree);
+    }
+
+    for (HWND hTree : treeList)
+    {
+        if (!IsWindow(hTree) || !IsWindowVisible(hTree))
+            continue;
+
+        RECT windowRect = {};
+        if (!GetWindowRect(hTree, &windowRect))
+            continue;
+
+        if (ptScreen.x < windowRect.left || ptScreen.x >= windowRect.right ||
+            ptScreen.y < windowRect.top || ptScreen.y >= windowRect.bottom)
+        {
+            continue;
+        }
+
+        POINT ptClient = ptScreen;
+        ScreenToClient(hTree, &ptClient);
+
+        TVHITTESTINFO ht = {};
+        ht.pt = ptClient;
+        HTREEITEM hItem = (HTREEITEM)SendMessageW(hTree, TVM_HITTEST, 0, (LPARAM)&ht);
+        if (!hItem || !IsDepth1Item(hTree, hItem) || !(ht.flags & TVHT_ONITEM))
+            continue;
+
+        RECT itemRect = {};
+        if (!GetItemRect(hTree, hItem, &itemRect))
+            continue;
+
+        if (hTreeOut)
+            *hTreeOut = hTree;
+        if (hItemOut)
+            *hItemOut = hItem;
+        if (itemRectOut)
+            *itemRectOut = itemRect;
+        return true;
+    }
+
+    return false;
+}
+
+static bool ResolveTrackedDropTarget(HWND *hTreeOut, HTREEITEM *hItemOut,
+                                     RECT *itemRectOut)
+{
+    std::vector<HWND> treeList;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_treesMutex);
+        treeList.reserve(g_trees.size());
+        for (auto& [hTree, ts] : g_trees)
+            treeList.push_back(hTree);
+    }
+
+    for (HWND hTree : treeList)
+    {
+        if (!IsWindow(hTree) || !IsWindowVisible(hTree))
+            continue;
+
+        HTREEITEM hItem = (HTREEITEM)SendMessageW(hTree, TVM_GETNEXTITEM,
+                                                  TVGN_DROPHILITE, 0);
+        if (!hItem || !IsDepth1Item(hTree, hItem))
+            continue;
+
+        RECT itemRect = {};
+        if (!GetItemRect(hTree, hItem, &itemRect))
+            continue;
+
+        if (hTreeOut)
+            *hTreeOut = hTree;
+        if (hItemOut)
+            *hItemOut = hItem;
+        if (itemRectOut)
+            *itemRectOut = itemRect;
+        return true;
+    }
+
+    return false;
+}
+
+static void InvalidateTrackedTrees()
+{
+    std::vector<HWND> treeList;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_treesMutex);
+        treeList.reserve(g_trees.size());
+        for (auto& [hTree, ts] : g_trees)
+            treeList.push_back(hTree);
+    }
+
+    for (HWND hTree : treeList)
+    {
+        if (!IsWindow(hTree))
+            continue;
+
+        RedrawWindow(hTree, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
+}
+
 static bool ShouldSuppressGlyphPaint(HWND hTree, HTREEITEM hItem, int partId)
 {
     if (!hItem || !IsDepth1Item(hTree, hItem))
@@ -1169,6 +1414,73 @@ static bool ShouldSuppressGlyphPaint(HWND hTree, HTREEITEM hItem, int partId)
         return true;
 
     return ts && ts->blockedGlyphItems.count(hItem);
+}
+
+static bool ShouldSuppressUnresolvedChevron(HDC hdc, int partId, int stateId, const RECT& glyphRect)
+{
+    HWND hWnd = ResolveWindowFromHdc(hdc);
+    if (hWnd)
+        return false;
+
+    HWND hTree = nullptr;
+    HTREEITEM hItem = nullptr;
+    RECT itemRect = {};
+    bool directTarget = ResolveTrackedGlyphTarget(glyphRect, &hTree, &hItem, &itemRect);
+    if (!directTarget &&
+        !ResolveTrackedDropTarget(&hTree, &hItem, &itemRect) &&
+        !ResolveTrackedCursorTarget(&hTree, &hItem, &itemRect))
+    {
+        hTree = nullptr;
+        hItem = nullptr;
+        itemRect = {};
+    }
+
+    if (directTarget && !IsSuppressionWindowActive(hTree))
+        RememberAllowedGlyphItem(hTree, hItem);
+
+    bool suppress = false;
+    if (hTree && hItem)
+        suppress = ShouldSuppressGlyphPaint(hTree, hItem, partId);
+
+    bool topStripFallback =
+        !suppress &&
+        !hTree &&
+        partId == TVP_HOTGLYPH &&
+        glyphRect.top == 0 &&
+        glyphRect.bottom > glyphRect.top &&
+        glyphRect.bottom <= 16;
+
+    if (!suppress && !topStripFallback)
+        return false;
+
+    if (partId == TVP_HOTGLYPH)
+    {
+        g_rawChevronSuppression.glyphRect = glyphRect;
+        g_rawChevronSuppression.tick = GetTickCount64();
+        g_rawChevronSuppression.active = true;
+    }
+
+    if (hTree && hItem)
+    {
+        WCHAR itemText[64] = {};
+        GetItemText(hTree, hItem, itemText, ARRAYSIZE(itemText));
+        Wh_Log(L"[CHEVRON-SUPPRESS-RAW] tree=%04X item=%04X '%s' part=%s state=%s glyph=(%d,%d,%d,%d)",
+               PTR4(hTree), PTR4(hItem), itemText, ChevronPartName(partId),
+               ChevronStateName(partId, stateId), glyphRect.left, glyphRect.top,
+               glyphRect.right, glyphRect.bottom);
+    }
+    else
+    {
+        Wh_Log(L"[CHEVRON-SUPPRESS-RAW] hwnd=0000 part=%s state=%s glyph=(%d,%d,%d,%d) heuristic=top-strip",
+               ChevronPartName(partId), ChevronStateName(partId, stateId),
+               glyphRect.left, glyphRect.top, glyphRect.right, glyphRect.bottom);
+    }
+    EraseGlyphRect(hdc, glyphRect);
+    if (hTree)
+        InvalidateRect(hTree, &itemRect, TRUE);
+    else if (topStripFallback)
+        InvalidateTrackedTrees();
+    return true;
 }
 
 struct RedrawFreeze {
@@ -2712,44 +3024,77 @@ LRESULT CALLBACK SubClassTreeWndProc_hook(HWND hWnd, UINT uMsg, WPARAM wParam, L
 }
 
 using DrawThemeBackground_t = HRESULT (WINAPI *)(HTHEME, HDC, int, int, LPCRECT, LPCRECT);
+using DrawThemeBackgroundEx_t = HRESULT (WINAPI *)(HTHEME, HDC, int, int, LPCRECT, const DTBGOPTS *);
 
 DrawThemeBackground_t DrawThemeBackground_orig;
+DrawThemeBackgroundEx_t DrawThemeBackgroundEx_orig;
+
+static bool HandleChevronThemeDraw(HDC hdc, int iPartId, int iStateId, LPCRECT pRect)
+{
+    HWND hTree = ResolveKnownTreeFromHdc(hdc);
+    if ((iPartId == TVP_GLYPH || iPartId == TVP_HOTGLYPH) &&
+        pRect)
+    {
+        if (!hTree)
+        {
+            LogChevronTraceUnresolved(hdc, iPartId, iStateId, *pRect);
+            if (ShouldSuppressUnresolvedChevron(hdc, iPartId, iStateId, *pRect))
+                return true;
+        }
+        else
+            LogChevronTrace(hTree, iPartId, iStateId, *pRect);
+
+        if (!hTree)
+            return false;
+
+        WCHAR itemText[64] = {};
+        HTREEITEM hItem = FindVisibleItemForGlyphRect(hTree, *pRect, nullptr,
+                                                      nullptr, itemText,
+                                                      ARRAYSIZE(itemText));
+        bool suppressionWindowActive = IsSuppressionWindowActive(hTree);
+        if (!suppressionWindowActive && iPartId == TVP_GLYPH)
+            RememberAllowedGlyphItem(hTree, hItem);
+        if (ShouldSuppressGlyphPaint(hTree, hItem, iPartId))
+        {
+            if (suppressionWindowActive && iPartId == TVP_GLYPH)
+                RememberBlockedGlyphItem(hTree, hItem);
+            Wh_Log(L"[CHEVRON-SUPPRESS] tree=%04X part=%s state=%s item=%04X '%s' action=%d age=%llu",
+                   PTR4(hTree), ChevronPartName(iPartId), ChevronStateName(iPartId, iStateId),
+                   PTR4(hItem), itemText, g_suppressedChevron.action,
+                   (unsigned long long)(GetTickCount64() - g_suppressedChevron.tick));
+            return true;
+        }
+        if (g_settings.fixChevronDrawing)
+        {
+            RECT drawRect;
+            CalcGlyphRect(pRect, &drawRect);
+            DrawChevron(hdc, &drawRect, iPartId, iStateId);
+            return true;
+        }
+    }
+    return false;
+}
 
 HRESULT WINAPI DrawThemeBackground_hook(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, LPCRECT pRect, LPCRECT pClipRect)
 {
     if (IsUnloading())
         return DrawThemeBackground_orig(hTheme, hdc, iPartId, iStateId, pRect, pClipRect);
 
-    if ((iPartId == TVP_GLYPH || iPartId == TVP_HOTGLYPH) &&
-        pRect && g_inTreePaint && g_treePaintHwnd)
-    {
-        LogChevronTrace(g_treePaintHwnd, iPartId, iStateId, *pRect);
-        WCHAR itemText[64] = {};
-        HTREEITEM hItem = FindVisibleItemForGlyphRect(g_treePaintHwnd, *pRect, nullptr,
-                                                      nullptr, itemText,
-                                                      ARRAYSIZE(itemText));
-        bool suppressionWindowActive = IsSuppressionWindowActive(g_treePaintHwnd);
-        if (!suppressionWindowActive && iPartId == TVP_GLYPH)
-            RememberAllowedGlyphItem(g_treePaintHwnd, hItem);
-        if (ShouldSuppressGlyphPaint(g_treePaintHwnd, hItem, iPartId))
-        {
-            if (suppressionWindowActive && iPartId == TVP_GLYPH)
-                RememberBlockedGlyphItem(g_treePaintHwnd, hItem);
-            Wh_Log(L"[CHEVRON-SUPPRESS] tree=%04X part=%s state=%s item=%04X '%s' action=%d age=%llu",
-                   PTR4(g_treePaintHwnd), ChevronPartName(iPartId), ChevronStateName(iPartId, iStateId),
-                   PTR4(hItem), itemText, g_suppressedChevron.action,
-                   (unsigned long long)(GetTickCount64() - g_suppressedChevron.tick));
-            return S_OK;
-        }
-        if (g_inTreePaint && g_settings.fixChevronDrawing)
-        {
-            RECT drawRect;
-            CalcGlyphRect(pRect, &drawRect);
-            DrawChevron(hdc, &drawRect, iPartId, iStateId);
-            return S_OK;
-        }
-    }
+    if (HandleChevronThemeDraw(hdc, iPartId, iStateId, pRect))
+        return S_OK;
+
     return DrawThemeBackground_orig(hTheme, hdc, iPartId, iStateId, pRect, pClipRect);
+}
+
+HRESULT WINAPI DrawThemeBackgroundEx_hook(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, LPCRECT pRect, const DTBGOPTS *pOptions)
+{
+    if (IsUnloading())
+        return DrawThemeBackgroundEx_orig(hTheme, hdc, iPartId, iStateId, pRect, pOptions);
+
+    if (HandleChevronThemeDraw(hdc, iPartId, iStateId, pRect))
+        return S_OK;
+
+    return DrawThemeBackgroundEx_orig(hTheme, hdc, iPartId, iStateId, pRect, pOptions);
 }
 
 // --- Settings ---
@@ -2926,6 +3271,14 @@ static bool InitializeModCore(HMODULE hExplorerFrame)
         }
         else
             Wh_Log(L"[CHEVRON] GetProcAddress(DrawThemeBackground) failed");
+
+        auto pDTBEx = (DrawThemeBackgroundEx_t)GetProcAddress(hUxTheme, "DrawThemeBackgroundEx");
+        if (pDTBEx)
+        {
+            WindhawkUtils::SetFunctionHook(pDTBEx, DrawThemeBackgroundEx_hook, &DrawThemeBackgroundEx_orig);
+        }
+        else
+            Wh_Log(L"[CHEVRON] GetProcAddress(DrawThemeBackgroundEx) failed");
     }
     else
         Wh_Log(L"[CHEVRON] uxtheme.dll not loaded");
